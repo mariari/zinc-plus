@@ -86,3 +86,66 @@ impl<S, V> Drop for ScalarProjCache<S, V> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One cache round-trip against a scalar living in this frame. The
+    /// scalar dies when the call returns, so its stack slot is free for
+    /// the next call's scalar. `#[inline(never)]` pins the frame layout,
+    /// making the address reuse deterministic across sequential calls at
+    /// the same call depth.
+    #[inline(never)]
+    fn round_trip(
+        cache: &mut ScalarProjCache<u64, u64>,
+        scalar: u64,
+        proj: u64,
+    ) -> (usize, Option<u64>) {
+        let scalar = std::hint::black_box(scalar);
+        let addr = &scalar as *const u64 as usize;
+        let hit = cache.get(&scalar);
+        if hit.is_none() {
+            cache.push(&scalar, proj);
+        }
+        (addr, hit)
+    }
+
+    /// Documents a footgun rather than guarding desired behavior: the
+    /// cache keys on the scalar's ADDRESS, so a scalar passed through a
+    /// short-lived temporary can alias a dead entry for a DIFFERENT
+    /// value, and `get` returns the stale projection. A caller that
+    /// evaluates each constant into a fresh per-iteration local (e.g. an
+    /// interpreted UAIR) sees every constant after the first evaluate as
+    /// the first; prover and verifier corrupt identically, so only a
+    /// ground-truth check catches it. Fix options: key by scalar value
+    /// (compare or hash) instead of pointer, or require `from_ref`/`mbs`
+    /// scalars to outlive the whole constrain call so temporaries can
+    /// never reuse a slot.
+    #[test]
+    fn pointer_reuse_returns_stale_projection() {
+        let mut cache = ScalarProjCache::<u64, u64>::new();
+
+        let (addr_a, hit_a) = round_trip(&mut cache, 41, 0xA);
+        assert_eq!(hit_a, None, "first probe must miss");
+
+        let (addr_b, hit_b) = round_trip(&mut cache, 43, 0xB);
+
+        if addr_a != addr_b {
+            // The collision needs address reuse; if this build laid the
+            // two frames out differently there is nothing to demonstrate.
+            eprintln!(
+                "skipping: temporaries at distinct addresses \
+                 ({addr_a:#x} vs {addr_b:#x})"
+            );
+            return;
+        }
+
+        // The collision: scalar 43 receives scalar 41's projection.
+        assert_eq!(
+            hit_b,
+            Some(0xA),
+            "expected the same-address temporary to hit the stale entry"
+        );
+    }
+}
