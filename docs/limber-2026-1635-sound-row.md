@@ -375,3 +375,51 @@ per cell), the GKR layer sumchecks 0.8 s, the CPR constraint closure
   signature (a 512-entry lookup-spec vector) on every evaluation — now
   captured once — and the int lookup prover's multiplicity histogram and
   leaf-denominator construction (4.2M cells each) are parallel.
+
+### Tried / measured but not the lever it looked like
+
+- **A narrower codeword width.** `Cw = i64` is impossible at this row
+  length: with `base_len = 16` and three radix-8 stages the worst-case
+  growth is `2^(16 + 15 + 4 + 3·18) = 2^89` and the typical magnitude
+  `≈ 2^78`; depth 2 (`base_len = 128`) still reaches `2^74`; only depth 1
+  (`base_len = 1024`, a 1024-term base multiply per output) fits 64 bits
+  and costs ~28× more base-layer work. The narrow-*stage* encoder above
+  is the usable version of this idea (widen after the first stage).
+- **Blocked Merkle gather** helped less than the profile suggested
+  (≈ −0.05 s): Blake3 over the 512 MB of codeword bytes is the floor of
+  the Merkle step. A 12-byte serialization of the `i128` codeword
+  entries (they are `< 2^89` in magnitude) would cut both the hashed
+  bytes and the opened columns by 25 %; not done (needs a `Cw` newtype
+  with its own `ConstTranscribable`).
+- **Merkle / open under `parallel`** were not the scaling problem; the
+  missing `zip-plus/parallel` forwarding was (see above).
+
+### Open
+
+- **Commit is now half of the single-threaded prover** (encode 0.68 s +
+  Merkle 0.33 s ≈ 1.0 of 2.1 s). The encoder's remaining cost is the two
+  `i128` radix-8 stages and the base-layer gather; the Merkle step is
+  Blake3 throughput. Levers: the 12-byte codeword serialization
+  (−25 % hashed bytes and −200 KB proof), a rate-1/4 code for the int
+  lane (half the codeword: less encode/hash, 150 openings instead of
+  100 — proof grows), or the structural route of committing the bits
+  over F₂ (`f2-int` / F2Z).
+- **Lookup GKR (0.45 s ST)**: the layer sumchecks are now eq-factored;
+  the remaining cost is the fraction-tree build (0.1 s) and the ~22
+  degree-2 layer rounds. A higher-arity tree (radix-4 layers halve the
+  number of sumchecks at the price of degree-4 rounds) and consuming the
+  tree layers by value instead of copying them into working arrays are
+  the next steps; the `Word{16}` table side is negligible.
+- **CPR (0.34 s ST)**: 41K evaluations of the 512-limb Horner constraint
+  (`≈ 900` field ops each). Factoring `eq` out of the multi-degree driver
+  (as done for the GKR layers) saves one of five evaluations per pair;
+  an affine-lazy expression type (evaluate the linear limb sums at two
+  points and only the product at five) would cut the evaluations ~5×,
+  but needs a polynomial-valued `ConstraintBuilder::Expr`.
+- **Proof size (1.27 MB raw / 845 KiB zstd)** is now the 100 opened
+  columns (100 × 512 × 16 B ≈ 0.8 MB) and the combined row (256 KB);
+  beyond the 12-byte codeword entries this is the Zip++ / recursive
+  opening question, not a serialization one.
+- **Verifier (18 ms)**: the table-side `q̃` evaluation of the `Word`
+  table has a closed form (`β − Σ_i 2^i r_i` for a full power-of-two
+  table) that would remove 2^16 field multiplications; not done.
