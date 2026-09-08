@@ -59,7 +59,10 @@ use zinc_utils::{
     named::Named,
 };
 use zip_plus::{
-    code::iprs::{IprsCode, PnttConfigF65537},
+    code::{
+        LinearCode,
+        iprs::{IprsCode, IprsCodeNarrow, PnttConfigF65537},
+    },
     pcs::structs::{ZipPlus, ZipTypes},
     utils::eprint_proof_size,
 };
@@ -170,6 +173,28 @@ where
     type ArrCombRDotChal = ArrCombRDotChal;
 }
 
+/// Marker selecting the int lane's code: the plain IPRS code, or the
+/// narrow-stage variant for 16-bit cells.
+trait IntLane<Zt: ZipTypes> {
+    type Code: LinearCode<Zt> + BenchCode;
+}
+#[derive(Clone, Debug)]
+struct PlainIprs;
+impl<Zt: ZipTypes> IntLane<Zt> for PlainIprs
+where
+    IprsCode<Zt, PnttConfigF65537, REP, PERFORM_CHECKS>: LinearCode<Zt>,
+{
+    type Code = IprsCode<Zt, PnttConfigF65537, REP, PERFORM_CHECKS>;
+}
+#[derive(Clone, Debug)]
+struct NarrowIprs;
+impl<Zt: ZipTypes> IntLane<Zt> for NarrowIprs
+where
+    IprsCodeNarrow<Zt, PnttConfigF65537, REP, PERFORM_CHECKS>: LinearCode<Zt>,
+{
+    type Code = IprsCodeNarrow<Zt, PnttConfigF65537, REP, PERFORM_CHECKS>;
+}
+
 #[derive(Clone, Debug)]
 struct GenericBenchZincTypes<
     Int,
@@ -182,6 +207,7 @@ struct GenericBenchZincTypes<
     Fmod,
     PrimeTest,
     const D: usize,
+    IntCode = PlainIprs,
 >(
     PhantomData<(
         Int,
@@ -193,10 +219,11 @@ struct GenericBenchZincTypes<
         IntCombR,
         Fmod,
         PrimeTest,
+        IntCode,
     )>,
 );
 
-impl<Int, CwR, Chal, Pt, BinaryCombR, CombR, IntCombR, Fmod, PrimeTest, const D: usize>
+impl<Int, CwR, Chal, Pt, BinaryCombR, CombR, IntCombR, Fmod, PrimeTest, const D: usize, IntCode>
     ZincTypes<D>
     for GenericBenchZincTypes<
         Int,
@@ -209,8 +236,28 @@ impl<Int, CwR, Chal, Pt, BinaryCombR, CombR, IntCombR, Fmod, PrimeTest, const D:
         Fmod,
         PrimeTest,
         D,
+        IntCode,
     >
 where
+    IntCode: IntLane<
+            GenericBenchZipTypes<
+                Int,
+                CwR,
+                Fmod,
+                PrimeTest,
+                Chal,
+                Pt,
+                IntCombR,
+                IntCombR,
+                ScalarProduct,
+                ScalarProduct,
+                MBSInnerProduct,
+            >,
+        > + Clone
+        + Debug
+        + Send
+        + Sync
+        + 'static,
     Int: ConstIntSemiring
         + for<'a> MulByScalar<&'a i64, CwR>
         + Named
@@ -318,7 +365,30 @@ where
 
     type BinaryLc = IprsCode<Self::BinaryZt, PnttConfigF65537, REP, PERFORM_CHECKS>;
     type ArbitraryLc = IprsCode<Self::ArbitraryZt, PnttConfigF65537, REP, PERFORM_CHECKS>;
-    type IntLc = IprsCode<Self::IntZt, PnttConfigF65537, REP, PERFORM_CHECKS>;
+    type IntLc = <IntCode as IntLane<Self::IntZt>>::Code;
+}
+
+/// How the harness builds a lane's linear code for a given row length.
+trait BenchCode: Sized {
+    fn bench_new(row_len: usize) -> Self;
+}
+
+impl<Zt: ZipTypes> BenchCode for IprsCode<Zt, PnttConfigF65537, REP, PERFORM_CHECKS> {
+    fn bench_new(row_len: usize) -> Self {
+        IprsCode::new_with_optimal_depth(row_len).expect("IPRS params")
+    }
+}
+
+/// The limb lane's code: the base layer and the first radix-8 stage run
+/// over `i64`. With 16-bit cells and the depth-3 code at row length 8192
+/// (`base_len = 16`) the base layer stays below `2^35` and the first stage
+/// below `2^53`, so one narrow stage is exact (CHECKED-validated at
+/// nvars = 13); the second stage would reach `2^71`.
+impl<Zt: ZipTypes> BenchCode for IprsCodeNarrow<Zt, PnttConfigF65537, REP, PERFORM_CHECKS> {
+    fn bench_new(row_len: usize) -> Self {
+        IprsCodeNarrow::new(IprsCode::new_with_optimal_depth(row_len).expect("IPRS params"), 1)
+            .expect("narrow IPRS params")
+    }
 }
 
 //
@@ -676,6 +746,7 @@ type RsaLimbZincTypes = GenericBenchZincTypes<
     /* Fmod        = */ Uint<FIELD_LIMBS>,
     MillerRabin,
     DEGREE_PLUS_ONE,
+    /* int code    = */ NarrowIprs,
 >;
 
 /// The 128 little-endian 16-bit limbs of N = 2^2048 − 59.
@@ -938,7 +1009,7 @@ fn $ufn(num_vars: usize, reps: usize) {
         ),
         ZipPlus::<<Zt as ZincTypes<DEGREE_PLUS_ONE>>::IntZt, _>::setup(
             row_len,
-            IprsCode::new_with_optimal_depth(row_len).unwrap(),
+            <<Zt as ZincTypes<DEGREE_PLUS_ONE>>::IntLc as BenchCode>::bench_new(row_len),
         ),
     );
 

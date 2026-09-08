@@ -326,3 +326,15 @@ per cell), the GKR layer sumchecks 0.8 s, the CPR constraint closure
   and the prover's combined-row accumulation run on 4 limbs (verify
   22.6 → 19.8 ms, step 7 0.105 → 0.061 s, LTO off). Together with the
   compact multiplicities: **raw 2.33 MB → 1.27 MB, zstd 881 → 845 KiB**.
+
+- **Narrow-stage IPRS encoder** (`zip-plus`: `pntt_widening`,
+  `IprsCodeNarrow`; the bench's limb lane uses it with one narrow stage).
+  With 16-bit cells the base layer (`16 · 2^15 · 2^16 < 2^35`) and the
+  first radix-8 stage (`< 2^53`) fit `i64`, so they run on 64-bit
+  integers and only the last two stages on `i128` (the second stage would
+  reach `2^71`). The codeword is identical; `CHECK = true` overflow-checks
+  every narrow operation, and a CHECKED full-size run passes. Int-lane
+  encode 0.818 → 0.712 s, commit 1.117 → 1.013 s (LTO off) — less than
+  the operation count suggests (the base-layer gather and the widening
+  pass are memory-bound), so the encoder's remaining cost is the
+  `i128` stages and the base-layer gather.
