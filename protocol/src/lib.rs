@@ -103,6 +103,15 @@ pub struct Proof<F: PrimeField> {
     /// computing the alpha-projected eval for the single bin Zip+
     /// open at `r*`.
     pub bin_lifts_at_r_star: Vec<DynamicPolynomialF<F>>,
+    /// Int twin of `bin_reducer_proof` — `Some` iff the UAIR has at least
+    /// one `Word`-table (int range-check) lookup group: the int multipoint
+    /// reducer folds every int-group `r_inner` claim plus the step-7 `r_0`
+    /// claim into ONE int Zip+ open at its reduced point. `None` otherwise
+    /// (int opened at `r_0` directly).
+    pub int_reducer_proof: Option<BinReducerProof<F>>,
+    /// Scalar MLE evals at the int reducer's `r*` for each witness int
+    /// column, in column order. Empty when `int_reducer_proof` is `None`.
+    pub int_evals_at_r_star: Vec<F>,
 }
 
 impl<F> GenTranscribable for Proof<F>
@@ -147,6 +156,27 @@ where
             }
             v => panic!("invalid bin_reducer_proof presence flag: {v}"),
         };
+
+        // [int_reducer_present: u8] [reducer_proof? : subset]
+        // [modulus] [u32 n] [n × F::Inner]   (the last three only if present)
+        let int_present = bytes[0];
+        let bytes = &bytes[1..];
+        let (int_reducer_proof, int_evals_at_r_star, bytes) = match int_present {
+            0 => (None, Vec::new(), bytes),
+            1 => {
+                let (rp, rest) = BinReducerProof::<F>::read_transcription_bytes_subset(bytes);
+                let mod_size = F::Modulus::NUM_BYTES;
+                let cfg = zinc_transcript::read_field_cfg::<F>(&rest[..mod_size]);
+                let rest = &rest[mod_size..];
+                let (n, rest) = u32::read_transcription_bytes_subset(rest);
+                let n = usize::try_from(n).expect("int eval count must fit in usize");
+                let inner_size = F::Inner::NUM_BYTES;
+                let (evals_bytes, rest) = rest.split_at(n * inner_size);
+                let evals = zinc_transcript::read_field_vec_with_cfg::<F>(evals_bytes, &cfg);
+                (Some(rp), evals, rest)
+            }
+            v => panic!("invalid int_reducer_proof presence flag: {v}"),
+        };
         assert!(bytes.is_empty(), "All bytes should be consumed");
 
         Self {
@@ -160,6 +190,8 @@ where
             lookup_proof,
             bin_reducer_proof,
             bin_lifts_at_r_star,
+            int_reducer_proof,
+            int_evals_at_r_star,
         }
     }
 
@@ -196,11 +228,31 @@ where
         let buf = self.lookup_proof.write_transcription_bytes_subset(buf);
 
         // [reducer_present: u8] then optional reducer_proof + bin_lifts.
-        match &self.bin_reducer_proof {
+        let buf = match &self.bin_reducer_proof {
             None => {
                 assert!(
                     self.bin_lifts_at_r_star.is_empty(),
                     "bin_lifts_at_r_star must be empty when reducer is absent"
+                );
+                buf[0] = 0;
+                &mut buf[1..]
+            }
+            Some(rp) => {
+                buf[0] = 1;
+                let buf = &mut buf[1..];
+                let buf = rp.write_transcription_bytes_subset(buf);
+                DynamicPolyVecF::reinterpret(&self.bin_lifts_at_r_star)
+                    .write_transcription_bytes_subset(buf)
+            }
+        };
+
+        // [int_reducer_present: u8] then optional reducer_proof + modulus +
+        // [u32 n] + n × F::Inner (the evals at the int reducer's r*).
+        match &self.int_reducer_proof {
+            None => {
+                assert!(
+                    self.int_evals_at_r_star.is_empty(),
+                    "int_evals_at_r_star must be empty when the int reducer is absent"
                 );
                 buf[0] = 0;
             }
@@ -208,8 +260,13 @@ where
                 buf[0] = 1;
                 let buf = &mut buf[1..];
                 let buf = rp.write_transcription_bytes_subset(buf);
-                DynamicPolyVecF::reinterpret(&self.bin_lifts_at_r_star)
-                    .write_transcription_bytes_subset(buf);
+                let modulus = rp.sumcheck_proof.claimed_sum.modulus();
+                let buf = zinc_transcript::append_field_cfg::<F>(buf, &modulus);
+                let n = u32::try_from(self.int_evals_at_r_star.len())
+                    .expect("int eval count must fit in u32");
+                n.write_transcription_bytes_exact(&mut buf[..u32::NUM_BYTES]);
+                let buf = &mut buf[u32::NUM_BYTES..];
+                zinc_transcript::append_field_vec_inner(buf, &self.int_evals_at_r_star);
             }
         }
     }
@@ -248,6 +305,17 @@ where
                         + rp.get_num_bytes()
                         + DynamicPolyVecF::<F>::LENGTH_NUM_BYTES
                         + bv.get_num_bytes()
+                }
+            }
+            + 1 // int_reducer_present flag
+            + match &self.int_reducer_proof {
+                None => 0,
+                Some(rp) => {
+                    BinReducerProof::<F>::LENGTH_NUM_BYTES
+                        + rp.get_num_bytes()
+                        + F::Modulus::NUM_BYTES
+                        + u32::NUM_BYTES
+                        + self.int_evals_at_r_star.len() * F::Inner::NUM_BYTES
                 }
             }
     }
@@ -945,6 +1013,7 @@ mod tests {
     use zinc_test_uair::{
         BigLinearUair, BigLinearUairWithPublicInput, BinLookup16MultiGroupUair,
         BinLookup16NoLookupUair, BinLookup16Uair, BinaryDecompositionUair,
+        IntLookup16OutOfRangeUair, IntLookup16Uair, MixedBinIntLookupUair,
         BitOpRotUair, EC_FP_INT_LIMBS, GenerateRandomTrace, Sha256CompressionSliceUair,
         Sha256Ideal, ShaEcdsaUair, TestUairMixedDegrees, TestUairMixedShifts,
         TestUairNoMultiplication, TestUairSimpleMultiplication,
@@ -1483,6 +1552,110 @@ mod tests {
             |res| {
                 assert!(res.is_err(), "verifier must reject a tampered lookup chunk lift");
             },
+        );
+    }
+
+    /// End-to-end test of the `Word`-table (integer range-check) lookup:
+    /// 4 witness int columns holding 16-bit values, all declared
+    /// `Word { width: 16 }`. Exercises `prove_group_int` / `verify_group_int`,
+    /// the int multipoint reducer (two claims: r_inner + r_0) and the single
+    /// int Zip+ open at its reduced point, plus proof serialization.
+    #[test]
+    fn test_e2e_int_lookup16() {
+        let num_vars = 8;
+        do_test::<TestZincTypesIprs, IntLookup16Uair<ZtInt>>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+            |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
+            |_| {},
+            |res| res.unwrap(),
+        );
+    }
+
+    /// A `Word`-table lookup on a subset of the int columns (one column is
+    /// NOT range-checked, so its `r_inner` eval goes through the non-parent
+    /// path) together with a `BitPoly` lookup on binary_poly columns — both
+    /// reducers run in one proof.
+    #[test]
+    fn test_e2e_mixed_bin_int_lookup() {
+        let num_vars = 8;
+        do_test::<TestZincTypesIprs, MixedBinIntLookupUair<ZtInt>>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+            |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
+            |_| {},
+            |res| res.unwrap(),
+        );
+    }
+
+    /// Negative tests for the int range check: a tampered per-column eval
+    /// at `r_inner` (the lookup's own lift) and a tampered eval at the int
+    /// reducer's `r*` must both be rejected.
+    #[test]
+    fn test_e2e_int_lookup16_tampered_rejected() {
+        let num_vars = 8;
+        do_test::<TestZincTypesIprs, IntLookup16Uair<ZtInt>>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+            |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
+            |proof| {
+                let g = &mut proof.lookup_proof.groups[0];
+                let e = g.chunk_lifts[0][1].coeffs.first().cloned().unwrap_or_else(F::zero);
+                g.chunk_lifts[0][1] = DynamicPolynomialF::new_trimmed(vec![e + F::one()]);
+                g.int_evals_at_r_inner[1] = g.int_evals_at_r_inner[1] + F::one();
+            },
+            |res| assert!(res.is_err(), "tampered r_inner eval must be rejected"),
+        );
+        do_test::<TestZincTypesIprs, IntLookup16Uair<ZtInt>>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+            |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
+            |proof| {
+                proof.int_evals_at_r_star[2] = proof.int_evals_at_r_star[2] + F::one();
+            },
+            |res| assert!(res.is_err(), "tampered r* eval must be rejected"),
+        );
+    }
+
+    /// The prover refuses a witness with a cell outside the declared range
+    /// (`Word { width: 16 }` with a value of `2^16`): the range check is
+    /// not something an honest-looking proof can be produced for.
+    #[test]
+    fn test_e2e_int_lookup16_out_of_range_witness_rejected() {
+        let num_vars = 6;
+        let pp = setup_pp::<TestZincTypesIprs>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+        );
+        let mut rng = rng();
+        let trace = IntLookup16OutOfRangeUair::<ZtInt>::generate_random_trace(num_vars, &mut rng);
+        let res = ZincPlusPiop::<TestZincTypesIprs, IntLookup16OutOfRangeUair<ZtInt>, F, DEGREE_PLUS_ONE>::prove::<
+            false,
+            CHECKED,
+        >(&pp, &trace, num_vars, project_scalar_fn);
+        assert!(
+            matches!(res, Err(ProtocolError::Lookup(LookupError::WitnessNotInTable))),
+            "an out-of-range int cell must make the prover fail with WitnessNotInTable, got {res:?}"
         );
     }
 

@@ -26,7 +26,7 @@ use rayon::prelude::*;
 use zinc_poly::{
     mle::DenseMultilinearExtension,
     univariate::{binary::BinaryPoly, dynamic::over_field::DynamicPolynomialF},
-    utils::build_eq_x_r_vec,
+    utils::{ArithErrors, build_eq_x_r_vec},
 };
 use zinc_transcript::traits::{ConstTranscribable, Transcript};
 use zinc_uair::LookupTableType;
@@ -39,7 +39,7 @@ use super::gkr::{
 use super::structs::{
     GkrLogupError, GkrLogupGroupMeta, GkrLogupGroupProof, GkrLogupGroupSubclaim,
 };
-use super::tables::generate_bitpoly_table;
+use super::tables::{generate_bitpoly_table, generate_word_table};
 
 // ---------------------------------------------------------------------------
 // Public input shape for `prove_group`.
@@ -319,6 +319,7 @@ where
         witness_gkr: witness_result.proof,
         table_gkr,
         bin_lifts_at_r_inner: Vec::new(),
+        int_evals_at_r_inner: Vec::new(),
     };
     let subclaim = GkrLogupGroupSubclaim {
         r_inner,
@@ -510,7 +511,7 @@ where
     //   expected_qs[ell] = β - Σ_k eq_outer(k, r_outer) · ψ_a(c_k'^(ell))
     //                       + padding_correction
     // (no padding when K·W is a power of 2)
-    let eq_at_outer = build_eq_x_r_vec(&r_outer, field_cfg)?;
+    let eq_at_outer = eq_table_or_unit(&r_outer, field_cfg)?;
     for ell in 0..num_lookups {
         if proof.chunk_lifts[ell].len() != num_chunks {
             return Err(GkrLogupError::GkrLeafMismatch);
@@ -524,6 +525,9 @@ where
             );
             psi_combined = psi_combined + &(eq_at_outer[k].clone() * &psi);
         }
+        // Padded leaves carry `(p, q) = (0, 1)`, so
+        // `q̃(r) = β · Σ_{j<KW} eq(j, r) − Σ_{j<KW} eq(j, r)·v_j + Σ_{j≥KW} eq(j, r)`
+        //        = β · (1 − pad) − psi_combined + pad`.
         let mut padding_correction = zero.clone();
         if per_lookup_leaves != (1usize << w_num_vars) {
             let eq_at_full = build_eq_x_r_vec(r_full, field_cfg)?;
@@ -531,7 +535,9 @@ where
                 padding_correction = padding_correction + &eq_at_full[j];
             }
         }
-        let expected_q_local = beta.clone() - &psi_combined + &padding_correction;
+        let expected_q_local = beta.clone() * &(one.clone() - &padding_correction)
+            - &psi_combined
+            + &padding_correction;
         if expected_q_local != witness_result.expected_qs[ell] {
             return Err(GkrLogupError::GkrLeafMismatch);
         }
@@ -545,6 +551,403 @@ where
     Ok(GkrLogupGroupSubclaim {
         r_inner,
         combined_polynomial,
+        parent_columns: meta.parent_columns.clone(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Int columns against a `Word` table (range checks on integer cells)
+// ---------------------------------------------------------------------------
+
+/// Inputs to [`prove_group_int`]: a group of witness **int** columns
+/// range-checked against `LookupTableType::Word { width, chunk_width: None }`,
+/// i.e. every cell must be an integer in `[0, 2^width)`.
+///
+/// The group is proved as ONE LogUp instance whose "chunks" are the `L`
+/// columns themselves: the witness fraction tree has `L · W` leaves
+/// (`leaf[k·W + i] = (1, β − v_k[i])`), there is a single aggregated
+/// multiplicity vector over the `2^width` table, and the GKR descent point
+/// splits as `r = (r_inner ∈ F^{n_vars}, r_outer ∈ F^{⌈log2 L⌉})` with the
+/// leaf identity `q̃(r) = β − Σ_k eq(k, r_outer) · MLE[v_k](r_inner)` (plus
+/// the padding term when `L · W` is not a power of two).
+///
+/// The prover sends the `L` scalars `MLE[v_k](r_inner)` as degree-0
+/// `chunk_lifts[0][k]`; the protocol layer binds them to the int
+/// commitment with the int multipoint reducer and a single Zip+ open.
+///
+/// Soundness of the range check: the int commitment's extractor yields a
+/// bounded-height rational `v = a/b` per cell; the LogUp forces
+/// `a·b⁻¹ ≡ t (mod q)` for a table entry `t < 2^width`, i.e.
+/// `q | (a − t·b)`, and since `|a − t·b| < q` for the prime sizes in use
+/// this gives `v = t` exactly — an integer in range.
+pub struct IntLookupInstance<'a, I> {
+    /// L parent int columns (the committed witness int MLEs).
+    pub parent_columns: Vec<&'a DenseMultilinearExtension<I>>,
+    /// L flat-trace column indices, mirrored into the proof's group meta.
+    pub parent_column_indices: Vec<usize>,
+    /// Lookup table type — must be `Word { width, chunk_width: None }`.
+    pub table_type: LookupTableType,
+    /// Number of MLE variables of each parent column (= log2(W)).
+    pub n_vars: usize,
+}
+
+/// Read an int cell as a `Word` table index.
+///
+/// The cell's little-endian transcription bytes must encode a
+/// non-negative integer below `2^width`: every byte beyond the low eight
+/// must be zero (which also rejects negative two's-complement values), and
+/// the low 64-bit value must be `< 2^width`. `buf` must be
+/// `I::NUM_BYTES` long (scratch space).
+pub fn int_table_index<I: ConstTranscribable>(v: &I, width: usize, buf: &mut [u8]) -> Option<u64> {
+    debug_assert_eq!(buf.len(), I::NUM_BYTES);
+    v.write_transcription_bytes_exact(buf);
+    let n = buf.len().min(8);
+    let mut le = [0u8; 8];
+    le[..n].copy_from_slice(&buf[..n]);
+    if buf[n..].iter().any(|&b| b != 0) {
+        return None;
+    }
+    let val = u64::from_le_bytes(le);
+    if width < 64 && val >= (1u64 << width) {
+        return None;
+    }
+    Some(val)
+}
+
+/// The scalar carried by a degree-0 lift (`[]` after trimming means zero).
+pub fn lift_scalar<F: PrimeField>(poly: &DynamicPolynomialF<F>, zero: &F) -> F {
+    poly.coeffs.first().cloned().unwrap_or_else(|| zero.clone())
+}
+
+/// `eq(·, point)` table, or the one-entry table `[1]` for an empty point
+/// (a single chunk / a single column leaves no outer variables).
+fn eq_table_or_unit<F: PrimeField>(point: &[F], field_cfg: &F::Config) -> Result<Vec<F>, ArithErrors> {
+    if point.is_empty() {
+        Ok(vec![F::one_with_cfg(field_cfg)])
+    } else {
+        build_eq_x_r_vec(point, field_cfg)
+    }
+}
+
+/// Scalar MLE evaluations of a batch of `F`-valued columns (given as
+/// Montgomery-inner MLEs, e.g. the projected witness int columns) at a
+/// shared point: `Σ_i eq(i, point) · col[i]`. Builds the eq table once and
+/// parallelizes across columns.
+#[allow(clippy::arithmetic_side_effects)]
+pub fn compute_int_column_evals<F>(
+    cols: &[&DenseMultilinearExtension<F::Inner>],
+    point: &[F],
+    field_cfg: &F::Config,
+) -> Vec<F>
+where
+    F: InnerTransparentField + FromPrimitiveWithConfig + Send + Sync,
+    F::Inner: Send + Sync,
+    F::Config: Sync,
+{
+    let zero = F::zero_with_cfg(field_cfg);
+    let eq_table =
+        build_eq_x_r_vec(point, field_cfg).expect("compute_int_column_evals: eq table build failed");
+    cfg_iter!(cols)
+        .map(|col| {
+            let mut acc = zero.clone();
+            for (i, inner) in col.evaluations.iter().enumerate() {
+                let v = F::new_unchecked_with_cfg(inner.clone(), field_cfg);
+                acc = acc + &(eq_table[i].clone() * &v);
+            }
+            acc
+        })
+        .collect()
+}
+
+/// Prove one `Word`-table lookup group over int columns (see
+/// [`IntLookupInstance`]).
+///
+/// Returns the lookup proof, the group meta to embed in the outer proof,
+/// and the verifier sub-claim: `combined_polynomial[ell]` is the degree-0
+/// lift holding `MLE[v_ell](r_inner)`, which the protocol layer must bind
+/// to the int commitment (int multipoint reducer + Zip+ open).
+///
+/// Fails with [`GkrLogupError::WitnessNotInTable`] if any cell is not an
+/// integer in `[0, 2^width)`.
+#[allow(clippy::arithmetic_side_effects)]
+pub fn prove_group_int<F, I>(
+    transcript: &mut impl Transcript,
+    instance: &IntLookupInstance<'_, I>,
+    field_cfg: &F::Config,
+) -> Result<
+    (GkrLogupGroupProof<F>, GkrLogupGroupMeta, GkrLogupGroupSubclaim<F>),
+    GkrLogupError<F>,
+>
+where
+    F: InnerTransparentField + FromPrimitiveWithConfig + Send + Sync,
+    F::Inner: ConstTranscribable + Zero + Default + Send + Sync,
+    F::Modulus: ConstTranscribable,
+    F::Config: Sync,
+    I: ConstTranscribable + Send + Sync,
+{
+    let width = match instance.table_type {
+        LookupTableType::Word { width, chunk_width: None } => width,
+        _ => return Err(GkrLogupError::WitnessNotInTable),
+    };
+    assert!(
+        (1..=24).contains(&width),
+        "Word table width must be in 1..=24 (the table has 2^width entries), got {width}"
+    );
+    let num_cols = instance.parent_columns.len();
+    assert!(num_cols > 0, "int lookup group needs at least one column");
+    assert_eq!(num_cols, instance.parent_column_indices.len());
+    let n_vars = instance.n_vars;
+    let witness_len = 1usize << n_vars;
+    for col in &instance.parent_columns {
+        assert_eq!(col.evaluations.len(), witness_len, "int column length must be 2^n_vars");
+    }
+    let one = F::one_with_cfg(field_cfg);
+    let zero = F::zero_with_cfg(field_cfg);
+
+    // ---- Step 1: table index of every cell (rejects out-of-range cells) ----
+    let idx: Vec<Vec<u32>> = cfg_iter!(instance.parent_columns)
+        .map(|col| {
+            let mut buf = vec![0u8; I::NUM_BYTES];
+            col.evaluations
+                .iter()
+                .map(|v| int_table_index(v, width, &mut buf).map(|n| n as u32))
+                .collect::<Option<Vec<u32>>>()
+        })
+        .collect::<Option<Vec<Vec<u32>>>>()
+        .ok_or(GkrLogupError::WitnessNotInTable)?;
+
+    // ---- Step 2: the table T = {0, …, 2^width − 1} over F ----
+    let table: Vec<F> = generate_word_table::<F>(width, field_cfg);
+    let table_len = table.len();
+
+    // ---- Step 3: one multiplicity histogram over the whole group ----
+    let mut counts = vec![0u64; table_len];
+    for col in &idx {
+        for &n in col {
+            counts[n as usize] += 1;
+        }
+    }
+    let agg_mults: Vec<Vec<F>> =
+        vec![counts.into_iter().map(|c| F::from_with_cfg(c, field_cfg)).collect()];
+
+    // ---- Step 4: absorb the multiplicities, sample β (and α, unused with a
+    // single instance but kept for transcript symmetry with the bin path) ----
+    let mut buf = vec![0u8; F::Inner::NUM_BYTES];
+    transcript.absorb_random_field_slice(&agg_mults[0], &mut buf);
+    let beta: F = transcript.get_field_challenge(field_cfg);
+    let _alpha: F = transcript.get_field_challenge(field_cfg);
+
+    // ---- Step 5: the witness fraction tree over L·W leaves ----
+    let leaves = num_cols * witness_len;
+    let w_num_vars = zinc_utils::log2(leaves.next_power_of_two()) as usize;
+    let w_size = 1usize << w_num_vars;
+    let beta_minus_table: Vec<F> = table.iter().map(|t| beta.clone() - t).collect();
+    let mut leaf_q: Vec<F> = Vec::with_capacity(w_size);
+    for col in &idx {
+        for &n in col {
+            leaf_q.push(beta_minus_table[n as usize].clone());
+        }
+    }
+    let witness_tree = if leaves == w_size {
+        build_fraction_tree_ones_leaf(one.clone(), leaf_q)
+    } else {
+        let mut leaf_p = vec![one.clone(); leaves];
+        leaf_p.resize(w_size, zero.clone());
+        leaf_q.resize(w_size, one.clone());
+        build_fraction_tree(leaf_p, leaf_q)
+    };
+
+    // ---- Step 6: the table fraction tree ----
+    let t_num_vars = zinc_utils::log2(table_len.next_power_of_two()) as usize;
+    let t_size = 1usize << t_num_vars;
+    let mut t_leaf_p: Vec<F> = agg_mults[0].clone();
+    let mut t_leaf_q: Vec<F> = beta_minus_table;
+    t_leaf_p.resize(t_size, zero.clone());
+    t_leaf_q.resize(t_size, one.clone());
+    let table_tree = build_fraction_tree(t_leaf_p, t_leaf_q);
+
+    // ---- Step 7/8: GKRs ----
+    let witness_result = batched_gkr_fraction_prove(transcript, &[witness_tree], field_cfg);
+    let (table_gkr, _table_eval_point) = gkr_fraction_prove(transcript, &table_tree, field_cfg);
+
+    // ---- Step 9: per-column evals at r_inner (the degree-0 "chunk lifts") ----
+    let r_full = &witness_result.eval_point;
+    assert!(r_full.len() >= n_vars, "GKR descent must have at least n_vars row variables");
+    let r_inner: Vec<F> = r_full[..n_vars].to_vec();
+    let eq_inner = build_eq_x_r_vec(&r_inner, field_cfg).map_err(GkrLogupError::EqBuildError)?;
+    let evals: Vec<F> = cfg_iter!(idx)
+        .map(|col| {
+            let mut acc = zero.clone();
+            for (i, &n) in col.iter().enumerate() {
+                acc = acc + &(eq_inner[i].clone() * &table[n as usize]);
+            }
+            acc
+        })
+        .collect();
+    let chunk_lifts: Vec<Vec<DynamicPolynomialF<F>>> = vec![
+        evals
+            .iter()
+            .map(|e| DynamicPolynomialF::new_trimmed(vec![e.clone()]))
+            .collect(),
+    ];
+
+    let meta = GkrLogupGroupMeta {
+        table_type: instance.table_type.clone(),
+        num_lookups: 1,
+        num_chunks: num_cols,
+        chunk_width: width,
+        witness_len,
+        parent_columns: instance.parent_column_indices.clone(),
+    };
+    let subclaim = GkrLogupGroupSubclaim {
+        r_inner,
+        combined_polynomial: chunk_lifts[0].clone(),
+        parent_columns: meta.parent_columns.clone(),
+    };
+    let proof = GkrLogupGroupProof {
+        chunk_lifts,
+        aggregated_multiplicities: agg_mults,
+        witness_gkr: witness_result.proof,
+        table_gkr,
+        bin_lifts_at_r_inner: Vec::new(),
+        int_evals_at_r_inner: Vec::new(),
+    };
+    Ok((proof, meta, subclaim))
+}
+
+/// Verify one `Word`-table lookup group over int columns. Returns the
+/// sub-claim `(r_inner, [MLE[v_ell](r_inner)]_ell)` the protocol layer
+/// must bind to the int commitment.
+#[allow(clippy::arithmetic_side_effects)]
+pub fn verify_group_int<F>(
+    transcript: &mut impl Transcript,
+    proof: &GkrLogupGroupProof<F>,
+    meta: &GkrLogupGroupMeta,
+    field_cfg: &F::Config,
+) -> Result<GkrLogupGroupSubclaim<F>, GkrLogupError<F>>
+where
+    F: InnerTransparentField + FromPrimitiveWithConfig + Send + Sync,
+    F::Inner: ConstTranscribable + Zero + Default + Send + Sync,
+    F::Modulus: ConstTranscribable,
+    F::Config: Sync,
+{
+    let width = match &meta.table_type {
+        LookupTableType::Word { width, chunk_width: None } => *width,
+        _ => return Err(GkrLogupError::WitnessNotInTable),
+    };
+    if !(1..=24).contains(&width) {
+        return Err(GkrLogupError::WitnessNotInTable);
+    }
+    let num_cols = meta.num_chunks;
+    let witness_len = meta.witness_len;
+    if !witness_len.is_power_of_two() || num_cols == 0 {
+        return Err(GkrLogupError::GkrLeafMismatch);
+    }
+    let n_vars = zinc_utils::log2(witness_len) as usize;
+    let table_len = 1usize << width;
+    // Shape checks on the prover-supplied payload.
+    if meta.num_lookups != 1
+        || meta.chunk_width != width
+        || meta.parent_columns.len() != num_cols
+        || proof.chunk_lifts.len() != 1
+        || proof.chunk_lifts[0].len() != num_cols
+        || proof.aggregated_multiplicities.len() != 1
+        || proof.aggregated_multiplicities[0].len() != table_len
+        || proof.witness_gkr.roots_p.len() != 1
+        || proof.witness_gkr.roots_q.len() != 1
+    {
+        return Err(GkrLogupError::GkrLeafMismatch);
+    }
+    let zero = F::zero_with_cfg(field_cfg);
+    let one = F::one_with_cfg(field_cfg);
+
+    let table: Vec<F> = generate_word_table::<F>(width, field_cfg);
+    let mults = &proof.aggregated_multiplicities[0];
+
+    // ---- Step 1: absorb multiplicities, sample β (and α) ----
+    let mut buf = vec![0u8; F::Inner::NUM_BYTES];
+    transcript.absorb_random_field_slice(mults, &mut buf);
+    let beta: F = transcript.get_field_challenge(field_cfg);
+    let _alpha: F = transcript.get_field_challenge(field_cfg);
+
+    // ---- Step 2: witness + table GKR verify ----
+    let leaves = num_cols * witness_len;
+    let w_num_vars = zinc_utils::log2(leaves.next_power_of_two()) as usize;
+    let w_size = 1usize << w_num_vars;
+    let t_num_vars = zinc_utils::log2(table_len.next_power_of_two()) as usize;
+    let witness_result =
+        batched_gkr_fraction_verify(transcript, &proof.witness_gkr, w_num_vars, field_cfg)?;
+    let table_result = gkr_fraction_verify(transcript, &proof.table_gkr, t_num_vars, field_cfg)?;
+
+    // ---- Step 3: roots cross-check: p_w / q_w == p_t / q_t ----
+    let lhs = proof.witness_gkr.roots_p[0].clone() * &proof.table_gkr.root_q;
+    let rhs = proof.table_gkr.root_p.clone() * &proof.witness_gkr.roots_q[0];
+    if lhs != rhs {
+        return Err(GkrLogupError::GkrRootMismatch);
+    }
+
+    // ---- Step 4: multiplicity sum + table-side leaf check ----
+    let m_sum: F = mults.iter().cloned().fold(zero.clone(), |a, b| a + &b);
+    if m_sum != F::from_with_cfg(leaves as u64, field_cfg) {
+        return Err(GkrLogupError::MultiplicitySumMismatch {
+            expected: leaves as u64,
+            got: 0,
+        });
+    }
+    if table_result.point.is_empty() {
+        let expected_q = beta.clone() - &table[0];
+        if mults[0] != table_result.expected_p || expected_q != table_result.expected_q {
+            return Err(GkrLogupError::GkrLeafMismatch);
+        }
+    } else {
+        let eq_at_t = build_eq_x_r_vec(&table_result.point, field_cfg)?;
+        let mut p_eval = zero.clone();
+        let mut q_eval = zero.clone();
+        for j in 0..table_len {
+            p_eval = p_eval + &(mults[j].clone() * &eq_at_t[j]);
+            q_eval = q_eval + &((beta.clone() - &table[j]) * &eq_at_t[j]);
+        }
+        for e in eq_at_t.iter().skip(table_len) {
+            q_eval = q_eval + e;
+        }
+        if p_eval != table_result.expected_p || q_eval != table_result.expected_q {
+            return Err(GkrLogupError::GkrLeafMismatch);
+        }
+    }
+
+    // ---- Step 5: witness-side leaf check from the per-column evals ----
+    let r_full = &witness_result.point;
+    if r_full.len() != w_num_vars {
+        return Err(GkrLogupError::GkrLeafMismatch);
+    }
+    let r_inner: Vec<F> = r_full[..n_vars].to_vec();
+    let r_outer: Vec<F> = r_full[n_vars..].to_vec();
+    let mut padding = zero.clone();
+    if leaves != w_size {
+        let eq_at_full = build_eq_x_r_vec(r_full, field_cfg)?;
+        for e in eq_at_full.iter().skip(leaves) {
+            padding = padding + e;
+        }
+    }
+    // p̃(r) = Σ_{j<LW} eq(j, r) = 1 − pad.
+    if witness_result.expected_ps[0] != one.clone() - &padding {
+        return Err(GkrLogupError::GkrLeafMismatch);
+    }
+    // q̃(r) = β·(1 − pad) − Σ_k eq(k, r_outer)·MLE[v_k](r_inner) + pad.
+    let eq_at_outer = eq_table_or_unit(&r_outer, field_cfg)?;
+    let mut combined = zero.clone();
+    for k in 0..num_cols {
+        let e_k = lift_scalar(&proof.chunk_lifts[0][k], &zero);
+        combined = combined + &(eq_at_outer[k].clone() * &e_k);
+    }
+    let expected_q = beta.clone() * &(one.clone() - &padding) - &combined + &padding;
+    if expected_q != witness_result.expected_qs[0] {
+        return Err(GkrLogupError::GkrLeafMismatch);
+    }
+
+    Ok(GkrLogupGroupSubclaim {
+        r_inner,
+        combined_polynomial: proof.chunk_lifts[0].clone(),
         parent_columns: meta.parent_columns.clone(),
     })
 }
@@ -791,5 +1194,141 @@ mod tests {
         let mut v_ts = Blake3Transcript::new();
         let res = verify_group::<F>(&mut v_ts, &proof, &meta, &a, &cfg);
         assert!(res.is_err(), "verifier must reject tampered multiplicity");
+    }
+
+    // ---- int-column (Word table) variant ----
+
+    fn rand_int_col(n_vars: usize, width: usize, rng: &mut impl RngCore) -> DenseMultilinearExtension<i64> {
+        let len = 1usize << n_vars;
+        let mask = (1u64 << width) - 1;
+        let evals: Vec<i64> = (0..len).map(|_| (rng.next_u64() & mask) as i64).collect();
+        DenseMultilinearExtension::from_evaluations_vec(n_vars, evals, 0i64)
+    }
+
+    fn direct_int_eval(col: &DenseMultilinearExtension<i64>, point: &[F]) -> F {
+        let eq = build_eq_x_r_vec(point, &()).unwrap();
+        let mut acc = F::from(0u64);
+        for (i, v) in col.evaluations.iter().enumerate() {
+            acc = acc + eq[i].clone() * F::from(*v as u64);
+        }
+        acc
+    }
+
+    fn int_round_trip(num_cols: usize, width: usize, n_vars: usize, seed: u64) {
+        let cfg = ();
+        let mut rng = StdRng::seed_from_u64(seed);
+        let cols: Vec<_> = (0..num_cols).map(|_| rand_int_col(n_vars, width, &mut rng)).collect();
+        let instance = IntLookupInstance::<'_, i64> {
+            parent_columns: cols.iter().collect(),
+            parent_column_indices: (0..num_cols).collect(),
+            table_type: LookupTableType::Word { width, chunk_width: None },
+            n_vars,
+        };
+        let mut p_ts = Blake3Transcript::new();
+        let (proof, meta, prover_sub) =
+            prove_group_int::<F, i64>(&mut p_ts, &instance, &cfg).expect("prove");
+        assert_eq!(meta.num_chunks, num_cols);
+        let mut v_ts = Blake3Transcript::new();
+        let sub = verify_group_int::<F>(&mut v_ts, &proof, &meta, &cfg).expect("verify");
+        assert_eq!(prover_sub.r_inner, sub.r_inner);
+        assert_eq!(sub.combined_polynomial.len(), num_cols);
+        let zero = F::from(0u64);
+        for (k, col) in cols.iter().enumerate() {
+            assert_eq!(
+                lift_scalar(&sub.combined_polynomial[k], &zero),
+                direct_int_eval(col, &sub.r_inner),
+                "column {k} eval at r_inner"
+            );
+        }
+        // serialization round trip of the group payload via the top-level proof
+        let full = super::super::structs::GkrLogupLookupProof { groups: vec![proof], group_meta: vec![meta] };
+        let mut bytes = vec![0u8; zinc_transcript::traits::Transcribable::get_num_bytes(&full)];
+        zinc_transcript::traits::GenTranscribable::write_transcription_bytes_exact(&full, &mut bytes);
+        let back = <super::super::structs::GkrLogupLookupProof<F> as zinc_transcript::traits::GenTranscribable>::read_transcription_bytes_exact(&bytes);
+        assert_eq!(full, back);
+    }
+
+    #[test]
+    fn int_round_trip_word16_l4() {
+        int_round_trip(4, 16, 6, 11);
+    }
+
+    #[test]
+    fn int_round_trip_word8_l3_padded() {
+        // 3 columns: L·W is not a power of two → exercises the padding path.
+        int_round_trip(3, 8, 5, 12);
+    }
+
+    #[test]
+    fn int_round_trip_word8_l1() {
+        int_round_trip(1, 8, 5, 13);
+    }
+
+    #[test]
+    fn int_out_of_range_cell_rejected() {
+        let cfg = ();
+        let mut rng = StdRng::seed_from_u64(14);
+        let n_vars = 5;
+        let mut col = rand_int_col(n_vars, 8, &mut rng);
+        col.evaluations[7] = 256; // = 2^8, outside Word(8)
+        let neg = {
+            let mut c = rand_int_col(n_vars, 8, &mut rng);
+            c.evaluations[3] = -1;
+            c
+        };
+        for bad in [col, neg] {
+            let instance = IntLookupInstance::<'_, i64> {
+                parent_columns: vec![&bad],
+                parent_column_indices: vec![0],
+                table_type: LookupTableType::Word { width: 8, chunk_width: None },
+                n_vars,
+            };
+            let mut p_ts = Blake3Transcript::new();
+            let res = prove_group_int::<F, i64>(&mut p_ts, &instance, &cfg);
+            assert!(
+                matches!(res, Err(GkrLogupError::WitnessNotInTable)),
+                "out-of-range cell must be rejected by the prover"
+            );
+        }
+    }
+
+    #[test]
+    fn int_tampered_eval_rejected() {
+        let cfg = ();
+        let mut rng = StdRng::seed_from_u64(15);
+        let n_vars = 5;
+        let cols: Vec<_> = (0..2).map(|_| rand_int_col(n_vars, 8, &mut rng)).collect();
+        let instance = IntLookupInstance::<'_, i64> {
+            parent_columns: cols.iter().collect(),
+            parent_column_indices: vec![0, 1],
+            table_type: LookupTableType::Word { width: 8, chunk_width: None },
+            n_vars,
+        };
+        let mut p_ts = Blake3Transcript::new();
+        let (mut proof, meta, _) = prove_group_int::<F, i64>(&mut p_ts, &instance, &cfg).expect("prove");
+        let e = lift_scalar(&proof.chunk_lifts[0][1], &F::from(0u64));
+        proof.chunk_lifts[0][1] = DynamicPolynomialF::new_trimmed(vec![e + F::from(1u64)]);
+        let mut v_ts = Blake3Transcript::new();
+        assert!(verify_group_int::<F>(&mut v_ts, &proof, &meta, &cfg).is_err());
+
+        // and a tampered multiplicity
+        let mut p_ts = Blake3Transcript::new();
+        let (mut proof, meta, _) = prove_group_int::<F, i64>(&mut p_ts, &instance, &cfg).expect("prove");
+        proof.aggregated_multiplicities[0][0] =
+            proof.aggregated_multiplicities[0][0].clone() + F::from(1u64);
+        let mut v_ts = Blake3Transcript::new();
+        assert!(verify_group_int::<F>(&mut v_ts, &proof, &meta, &cfg).is_err());
+    }
+
+    #[test]
+    fn int_table_index_encoding() {
+        let mut buf = vec![0u8; 8];
+        assert_eq!(int_table_index(&255i64, 8, &mut buf), Some(255));
+        assert_eq!(int_table_index(&256i64, 8, &mut buf), None);
+        assert_eq!(int_table_index(&-1i64, 8, &mut buf), None);
+        assert_eq!(int_table_index(&0i64, 1, &mut buf), Some(0));
+        let mut buf16 = vec![0u8; 16];
+        assert_eq!(int_table_index(&65535i128, 16, &mut buf16), Some(65535));
+        assert_eq!(int_table_index(&(1i128 << 70), 16, &mut buf16), None);
     }
 }

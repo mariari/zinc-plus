@@ -347,6 +347,222 @@ where
     }
 }
 
+/// Synthetic int range-check UAIR: 4 witness int columns holding 16-bit
+/// values, all declared as one `Word { width: 16 }` lookup group (the
+/// integer-cell range check of the GKR-LogUp argument). The algebraic
+/// constraint is trivial — the lookup carries the soundness work. Used to
+/// validate the int lookup path (int multipoint reducer + single int open)
+/// end-to-end.
+#[derive(Clone, Debug)]
+pub struct IntLookup16Uair<R>(PhantomData<R>);
+
+impl<R> Uair for IntLookup16Uair<R>
+where
+    R: ConstSemiring + 'static,
+{
+    type Ideal = ImpossibleIdeal;
+    type Scalar = DensePolynomial<R, 32>;
+
+    fn signature() -> UairSignature {
+        let total = TotalColumnLayout::new(0, 0, 4);
+        let lookup_specs: Vec<LookupColumnSpec> = (0..4)
+            .map(|i| LookupColumnSpec {
+                column_index: i,
+                table_type: LookupTableType::Word { width: 16, chunk_width: None },
+            })
+            .collect();
+        UairSignature::new(total, PublicColumnLayout::default(), vec![], lookup_specs, vec![])
+    }
+
+    fn constrain_general<B, FromR, MulByScalar, IFromR>(
+        b: &mut B,
+        up: TraceRow<B::Expr>,
+        _down: TraceRow<B::Expr>,
+        _from_ref: FromR,
+        _mbs: MulByScalar,
+        _ideal_from_ref: IFromR,
+    ) where
+        B: ConstraintBuilder,
+    {
+        // Trivially-satisfied constraint (the lookup carries the soundness work).
+        let v = &up.int[0];
+        b.assert_zero(v.clone() - v);
+    }
+}
+
+/// Random 16-bit int columns for [`IntLookup16Uair`] and friends.
+fn random_word_int_cols<R: ConstSemiring + From<u32>>(
+    num_cols: usize,
+    num_vars: usize,
+    width: u32,
+    rng: &mut (impl RngCore + ?Sized),
+) -> Vec<DenseMultilinearExtension<R>> {
+    let row_count = 1usize << num_vars;
+    let mask = (1u32 << width) - 1;
+    (0..num_cols)
+        .map(|_| {
+            (0..row_count)
+                .map(|_| R::from(rng.next_u32() & mask))
+                .collect::<DenseMultilinearExtension<R>>()
+        })
+        .collect()
+}
+
+impl<R> GenerateRandomTrace<32> for IntLookup16Uair<R>
+where
+    R: ConstSemiring + From<u32> + 'static,
+{
+    type PolyCoeff = R;
+    type Int = R;
+
+    fn generate_random_trace<Rng: RngCore + ?Sized>(
+        num_vars: usize,
+        rng: &mut Rng,
+    ) -> UairTrace<'static, R, R, 32> {
+        UairTrace {
+            int: random_word_int_cols::<R>(4, num_vars, 16, rng).into(),
+            ..Default::default()
+        }
+    }
+}
+
+/// [`IntLookup16Uair`] with a dishonest trace: one cell holds `2^16`,
+/// outside the declared `Word { width: 16 }` range. The prover must refuse
+/// to build the lookup.
+#[derive(Clone, Debug)]
+pub struct IntLookup16OutOfRangeUair<R>(PhantomData<R>);
+
+impl<R> Uair for IntLookup16OutOfRangeUair<R>
+where
+    R: ConstSemiring + 'static,
+{
+    type Ideal = ImpossibleIdeal;
+    type Scalar = DensePolynomial<R, 32>;
+
+    fn signature() -> UairSignature {
+        IntLookup16Uair::<R>::signature()
+    }
+
+    fn constrain_general<B, FromR, MulByScalar, IFromR>(
+        b: &mut B,
+        up: TraceRow<B::Expr>,
+        down: TraceRow<B::Expr>,
+        from_ref: FromR,
+        mbs: MulByScalar,
+        ideal_from_ref: IFromR,
+    ) where
+        B: ConstraintBuilder,
+        FromR: Fn(&Self::Scalar) -> B::Expr,
+        MulByScalar: Fn(&B::Expr, &Self::Scalar) -> Option<B::Expr>,
+        IFromR: Fn(&Self::Ideal) -> B::Ideal,
+    {
+        IntLookup16Uair::<R>::constrain_general(b, up, down, from_ref, mbs, ideal_from_ref)
+    }
+}
+
+impl<R> GenerateRandomTrace<32> for IntLookup16OutOfRangeUair<R>
+where
+    R: ConstSemiring + From<u32> + 'static,
+{
+    type PolyCoeff = R;
+    type Int = R;
+
+    fn generate_random_trace<Rng: RngCore + ?Sized>(
+        num_vars: usize,
+        rng: &mut Rng,
+    ) -> UairTrace<'static, R, R, 32> {
+        let mut cols = random_word_int_cols::<R>(4, num_vars, 16, rng);
+        let row = (rng.next_u32() as usize) % (1usize << num_vars);
+        cols[2][row] = R::from(1u32 << 16);
+        UairTrace {
+            int: cols.into(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Mixed lookups in one UAIR: 2 witness binary_poly columns under a
+/// `BitPoly { width: 32, chunk_width: 8 }` group AND 3 witness int columns
+/// of which only the first and the last are range-checked
+/// (`Word { width: 8 }`) — the middle one is a non-parent int column, so
+/// its `r_inner` eval goes through the computed (non-lookup) path. Both the
+/// bin and the int multipoint reducers run in the same proof.
+#[derive(Clone, Debug)]
+pub struct MixedBinIntLookupUair<R>(PhantomData<R>);
+
+impl<R> Uair for MixedBinIntLookupUair<R>
+where
+    R: ConstSemiring + 'static,
+{
+    type Ideal = ImpossibleIdeal;
+    type Scalar = DensePolynomial<R, 32>;
+
+    fn signature() -> UairSignature {
+        let total = TotalColumnLayout::new(2, 0, 3);
+        let lookup_specs = vec![
+            LookupColumnSpec {
+                column_index: 0,
+                table_type: LookupTableType::BitPoly { width: 32, chunk_width: Some(8) },
+            },
+            LookupColumnSpec {
+                column_index: 1,
+                table_type: LookupTableType::BitPoly { width: 32, chunk_width: Some(8) },
+            },
+            // int columns are flat indices 2, 3, 4 (after the 2 bin columns)
+            LookupColumnSpec {
+                column_index: 2,
+                table_type: LookupTableType::Word { width: 8, chunk_width: None },
+            },
+            LookupColumnSpec {
+                column_index: 4,
+                table_type: LookupTableType::Word { width: 8, chunk_width: None },
+            },
+        ];
+        UairSignature::new(total, PublicColumnLayout::default(), vec![], lookup_specs, vec![])
+    }
+
+    fn constrain_general<B, FromR, MulByScalar, IFromR>(
+        b: &mut B,
+        up: TraceRow<B::Expr>,
+        _down: TraceRow<B::Expr>,
+        _from_ref: FromR,
+        _mbs: MulByScalar,
+        _ideal_from_ref: IFromR,
+    ) where
+        B: ConstraintBuilder,
+    {
+        let v = &up.int[1];
+        b.assert_zero(v.clone() - v);
+    }
+}
+
+impl<R> GenerateRandomTrace<32> for MixedBinIntLookupUair<R>
+where
+    R: ConstSemiring + From<u32> + 'static,
+{
+    type PolyCoeff = R;
+    type Int = R;
+
+    fn generate_random_trace<Rng: RngCore + ?Sized>(
+        num_vars: usize,
+        rng: &mut Rng,
+    ) -> UairTrace<'static, R, R, 32> {
+        let row_count = 1usize << num_vars;
+        let bins: Vec<DenseMultilinearExtension<BinaryPoly<32>>> = (0..2)
+            .map(|_| {
+                (0..row_count)
+                    .map(|_| BinaryPoly::<32>::from(rng.next_u32()))
+                    .collect::<DenseMultilinearExtension<BinaryPoly<32>>>()
+            })
+            .collect();
+        UairTrace {
+            binary_poly: bins.into(),
+            int: random_word_int_cols::<R>(3, num_vars, 8, rng).into(),
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TestUairNoMultiplication<R>(PhantomData<R>);
 

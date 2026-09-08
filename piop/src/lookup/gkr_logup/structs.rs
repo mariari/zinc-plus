@@ -127,6 +127,14 @@ pub struct GkrLogupGroupProof<F: PrimeField> {
     /// non-parent columns' entries get bound transitively via the same
     /// alpha-projection (any tampering breaks the Zip+ verify).
     pub bin_lifts_at_r_inner: Vec<DynamicPolynomialF<F>>,
+    /// Int-group counterpart of `bin_lifts_at_r_inner`: the scalar MLE
+    /// evaluation of every witness **int** column at this group's
+    /// `r_inner`, in witness-int-col index order (length = the int
+    /// commitment's batch size; empty for `BitPoly` groups). Parent
+    /// columns' entries are cross-checked against `chunk_lifts[0][k]`; the
+    /// whole vector is bound to the int commitment by the step-7 int
+    /// multipoint reducer's single Zip+ open at `r*`.
+    pub int_evals_at_r_inner: Vec<F>,
 }
 
 /// Static metadata for one lookup group, ported alongside the proof so
@@ -685,13 +693,21 @@ where
         DynamicPolyVecF::<F>::LENGTH_NUM_BYTES,
         bin_lifts_v.get_num_bytes()
     );
+    // int_evals_at_r_inner: u32 n, then n × F::Inner.
+    let int_evals_bytes = add!(
+        u32::NUM_BYTES,
+        mul!(g.int_evals_at_r_inner.len(), F::Inner::NUM_BYTES)
+    );
     add!(
         chunk_lifts_bytes,
         add!(
             mults_bytes,
             add!(
                 batched_fraction_num_bytes(&g.witness_gkr),
-                add!(fraction_num_bytes(&g.table_gkr), bin_lifts_bytes)
+                add!(
+                    fraction_num_bytes(&g.table_gkr),
+                    add!(bin_lifts_bytes, int_evals_bytes)
+                )
             )
         )
     )
@@ -719,8 +735,10 @@ where
     }
     buf = write_batched_fraction(buf, &g.witness_gkr);
     buf = write_fraction(buf, &g.table_gkr);
-    DynamicPolyVecF::reinterpret(&g.bin_lifts_at_r_inner)
-        .write_transcription_bytes_subset(buf)
+    buf = DynamicPolyVecF::reinterpret(&g.bin_lifts_at_r_inner)
+        .write_transcription_bytes_subset(buf);
+    buf = write_u32_prefix(buf, g.int_evals_at_r_inner.len());
+    write_f_inner_slice(buf, &g.int_evals_at_r_inner)
 }
 
 #[allow(clippy::arithmetic_side_effects)]
@@ -760,6 +778,8 @@ where
     let (witness_gkr, bytes) = read_batched_fraction::<F>(bytes, cfg);
     let (table_gkr, bytes) = read_fraction::<F>(bytes, cfg);
     let (bin_lifts_v, bytes) = DynamicPolyVecF::<F>::read_transcription_bytes_subset(bytes);
+    let (n_int, bytes) = read_u32_prefix(bytes);
+    let (int_evals_at_r_inner, bytes) = read_f_inner_slice::<F>(bytes, n_int, cfg);
     (
         GkrLogupGroupProof {
             chunk_lifts,
@@ -767,6 +787,7 @@ where
             witness_gkr,
             table_gkr,
             bin_lifts_at_r_inner: bin_lifts_v.0,
+            int_evals_at_r_inner,
         },
         bytes,
     )
@@ -1013,6 +1034,15 @@ where
             "    bin_lifts_at_r_inner ({} polys × ≤D coeffs):{}",
             g.bin_lifts_at_r_inner.len(),
             bin_lifts_bytes
+        );
+        let _ = writeln!(
+            s,
+            "    int_evals_at_r_inner ({} scalars):            {}",
+            g.int_evals_at_r_inner.len(),
+            add!(
+                u32::NUM_BYTES,
+                mul!(g.int_evals_at_r_inner.len(), F::Inner::NUM_BYTES)
+            )
         );
 
         let group_total = group_num_bytes(g);
