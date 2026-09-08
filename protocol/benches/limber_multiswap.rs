@@ -648,15 +648,19 @@ impl GenerateRandomTrace<DEGREE_PLUS_ONE> for RsaModMulWide16Uair {
 const LIMB_BITS: u32 = 16;
 const LIMBS_PER_VALUE: usize = 2048 / LIMB_BITS as usize; // 128
 const LIMB_COLS: usize = 4 * LIMBS_PER_VALUE; // a | b | c | u
-const LIMB_INT: usize = 1; // one 64-bit limb per 16-bit cell (sign headroom included)
-const LIMB_CW: usize = 2; // 128-bit codeword entries: the encoder grows 16-bit limbs by < 112 bits (CHECKED-validated at nvars = 13)
 const LIMB_M: usize = 6; // combination ring: Cw + 128-bit alphas/coeffs + row sums
 
-type LimbInt = Int<LIMB_INT>;
+/// One native 64-bit cell per 16-bit limb (sign headroom included) and
+/// native 128-bit codeword entries: the encoder grows 16-bit limbs by
+/// < 112 bits (CHECKED-validated at nvars = 13). Native `i64` / `i128`
+/// rather than `Int<1>` / `Int<2>`: same widths, but the IPRS butterflies
+/// then run on machine integers instead of crypto-bigint limb loops.
+type LimbInt = i64;
+type LimbCw = i128;
 
 type RsaLimbZincTypes = GenericBenchZincTypes<
     /* Int         = */ LimbInt,
-    /* CwR         = */ Int<LIMB_CW>,
+    /* CwR         = */ LimbCw,
     /* Chal        = */ i128,
     /* Pt          = */ i128,
     /* BinaryCombR = */ Int<5>,
@@ -675,7 +679,7 @@ fn modulus_limbs16() -> [i64; LIMBS_PER_VALUE] {
 }
 
 fn limb_int(v: u64) -> LimbInt {
-    *Uint::<LIMB_INT>::new(crypto_bigint::Uint::<LIMB_INT>::from_u64(v)).as_int()
+    i64::try_from(v).expect("16-bit limb fits an i64")
 }
 
 /// Little-endian 16-bit limbs of a 4096-bit-capable value (only the low
@@ -1026,6 +1030,32 @@ fn $ufn(num_vars: usize, reps: usize) {
         }
         let s = <piop!()>::step0_commit(&pp, &trace, num_vars).expect("step0");
         lap!("0 commit");
+        // 0a / 0b: the int lane's commit split into IPRS encoding and
+        // Merkle hashing (re-done here outside the protocol; the two
+        // together are the "0 commit" line above for an int-only trace).
+        let (t_enc, t_mt) = {
+            let sig = U::signature();
+            let witness = trace.witness(&sig);
+            let t = Instant::now();
+            let cw: Vec<_> = witness
+                .int
+                .iter()
+                .map(|poly| {
+                    ZipPlus::<<Zt as ZincTypes<DEGREE_PLUS_ONE>>::IntZt, _>::encode_rows(
+                        &pp.2,
+                        &poly.evaluations,
+                    )
+                })
+                .collect();
+            let t_enc = t.elapsed().as_secs_f64();
+            let rows: Vec<&[_]> = cw.iter().flat_map(|m| m.as_rows()).collect();
+            let t = Instant::now();
+            let mt = zip_plus::merkle::MerkleTree::new(&rows);
+            let t_mt = t.elapsed().as_secs_f64();
+            black_box(mt);
+            (t_enc, t_mt)
+        };
+        lap = Instant::now();
         let s = s.step1_combined(zinc_protocol::project_scalar_fn).expect("step1");
         lap!("1 prime projection");
         let s = s.step2_ideal_check().expect("step2");
@@ -1050,6 +1080,7 @@ fn $ufn(num_vars: usize, reps: usize) {
         for (name, t) in &times {
             eprintln!("      {name:<28} {t:8.3} s  ({:5.1}%)", 100.0 * t / total);
         }
+        eprintln!("      (0 commit, int lane re-run: encode {t_enc:.3} s, merkle {t_mt:.3} s)");
     }
 }
     };

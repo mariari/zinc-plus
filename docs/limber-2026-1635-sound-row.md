@@ -219,3 +219,31 @@ Branch `main-beta-limber-updates` (merged into `main-beta`), worktree
 `test_e2e_mixed_bin_int_lookup`, `test_e2e_random_projecting_prime_128`,
 `batched_verify_rejects_evaluation_mass_transfer`, plus the piop unit tests
 of `gkr_logup::protocol` and `int_multipoint_reducer`.
+
+## 7. Optimization log (2026-09-08, branch `main-beta-limber-updates`)
+
+Goal: bring the sound `LIMB16=1 NVARS=13` row as close to Limber's
+prover time as possible without touching soundness, the security
+parameters, verifier time or proof size. Same machine and methodology as
+§4 (Apple M4, single-threaded unless marked MT, `simd unchecked
+iprs-rate-1-8`, LTO, `-C target-cpu=native`, medians of 3). The baseline
+re-measured at the start of this pass: **prove 5.074 s / verify 21.1 ms /
+2.33 MB raw / 876 KiB zstd** (commit 2.12 s, lookup 0.93 s, open 0.93 s,
+CPR 0.41 s). A `sample` profile of the prover attributed the time as:
+IPRS encode 2.1 s (crypto-bigint `Int<2>` limb loops), Merkle 0.4 s,
+the Zip+ open's `b` inner product 0.6 s (a 384-bit → field `Uint::rem`
+per cell), the GKR layer sumchecks 0.8 s, the CPR constraint closure
+0.3 s.
+
+### Shipped
+
+- **Native `i64` cells / `i128` codeword entries for the limb lane**
+  (bench-only: `RsaLimbZincTypes` now uses `Int = i64`, `CwR = i128`
+  instead of `Int<1>` / `Int<2>`; same 64/128-bit widths, so the
+  CHECKED-validated growth bound is unchanged, re-validated with a
+  CHECKED full-size run). The IPRS base layer and butterflies run on
+  machine integers (`mul`/`umulh`/`madd`) instead of crypto-bigint's
+  generic limb loops. Encode 2.13 → 0.74 s, commit 2.12 → 1.08 s,
+  **prove 5.074 → 4.102 s**; verify 21.0 ms and proof bytes identical.
+  The `STEPS=1` mode now also prints the int lane's encode / Merkle
+  split.
