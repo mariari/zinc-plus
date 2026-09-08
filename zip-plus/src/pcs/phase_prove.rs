@@ -44,7 +44,7 @@ fn stream_pos(transcript: &PcsProverTranscript) -> usize {
 }
 use crypto_primitives::{FromWithConfig, IntoWithConfig, PrimeField};
 use itertools::Itertools;
-use num_traits::{ConstOne, ConstZero, Zero};
+use num_traits::{ConstOne, ConstZero};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use zinc_poly::{Polynomial, mle::DenseMultilinearExtension};
@@ -180,6 +180,66 @@ impl<Zt: ZipTypes, Lc: LinearCode<Zt>> ZipPlus<Zt, Lc> {
             commit_hint,
             field_cfg,
             None,
+            None,
+        )
+    }
+
+    /// Like [`Self::prove_f`], for a scalar-lane batch committed as a
+    /// single row per polynomial (`pp.num_rows == 1`,
+    /// `Zt::Comb::DEGREE_BOUND == 0`) whose evaluations at `point` the
+    /// caller already knows: `evals[j] = MLE[polys[j]](point)` in `F`
+    /// (i.e. of the polynomial's cells reduced into `F`).
+    ///
+    /// With a single row per polynomial the transmitted row sum is
+    /// `b = Σ_j alpha_j · <poly_j, eq(·, point)> = Σ_j alpha_j · evals[j]`,
+    /// so the generic path's per-cell wide-integer → `F` reduction (the
+    /// dominant cost of opening a wide batch of narrow columns: one
+    /// `CombR`-sized division per cell) is skipped. The proof bytes are
+    /// identical to [`Self::prove_f`]'s; the verifier is unchanged.
+    ///
+    /// # Errors
+    /// `ZipError::InvalidPcsParam` if the lane is not a single-row scalar
+    /// lane or `evals.len() != polys.len()`.
+    pub fn prove_f_with_evals<F, const CHECK_FOR_OVERFLOW: bool>(
+        transcript: &mut PcsProverTranscript,
+        pp: &ZipPlusParams<Zt, Lc>,
+        polys: &[DenseMultilinearExtension<Zt::Eval>],
+        point: &[F],
+        commit_hint: &ZipPlusHint<Zt::Cw>,
+        field_cfg: &F::Config,
+        evals: &[F],
+    ) -> Result<F, ZipError>
+    where
+        F: PrimeField
+            + for<'a> FromWithConfig<&'a Zt::CombR>
+            + for<'a> FromWithConfig<&'a Zt::Chal>
+            + for<'a> MulByScalar<&'a F>
+            + FromRef<F>,
+        F::Inner: Transcribable,
+        F::Modulus: Transcribable,
+    {
+        if pp.num_rows != 1 || Zt::Comb::DEGREE_BOUND != 0 {
+            return Err(ZipError::InvalidPcsParam(
+                "prove_f_with_evals needs a single-row scalar lane".to_owned(),
+            ));
+        }
+        if evals.len() != polys.len() {
+            return Err(ZipError::InvalidPcsParam(format!(
+                "prove_f_with_evals: {} evaluations for {} polynomials",
+                evals.len(),
+                polys.len()
+            )));
+        }
+        let alpha_to_f = |alpha: &Zt::Chal| F::from_with_cfg(alpha, field_cfg);
+        Self::prove_f_inner::<F, CHECK_FOR_OVERFLOW>(
+            transcript,
+            pp,
+            polys,
+            point,
+            commit_hint,
+            field_cfg,
+            None,
+            Some((evals, &alpha_to_f)),
         )
     }
 
@@ -213,10 +273,15 @@ impl<Zt: ZipTypes, Lc: LinearCode<Zt>> ZipPlus<Zt, Lc> {
             commit_hint,
             field_cfg,
             Some(breakdown),
+            None,
         )
     }
 
-    #[allow(clippy::arithmetic_side_effects)]
+    /// The opening proper. `known_evals`, when given, is
+    /// `(evals, alpha_to_f)` with `evals[j] = MLE[polys[j]](point)`; it is
+    /// only honoured for single-row scalar lanes (see
+    /// [`Self::prove_f_with_evals`]).
+    #[allow(clippy::arithmetic_side_effects, clippy::too_many_arguments)]
     fn prove_f_inner<F, const CHECK_FOR_OVERFLOW: bool>(
         transcript: &mut PcsProverTranscript,
         pp: &ZipPlusParams<Zt, Lc>,
@@ -225,6 +290,7 @@ impl<Zt: ZipTypes, Lc: LinearCode<Zt>> ZipPlus<Zt, Lc> {
         commit_hint: &ZipPlusHint<Zt::Cw>,
         field_cfg: &F::Config,
         mut breakdown: Option<&mut ZipPlusProveByteBreakdown>,
+        known_evals: Option<(&[F], &(dyn Fn(&Zt::Chal) -> F + Sync))>,
     ) -> Result<F, ZipError>
     where
         F: PrimeField
@@ -253,33 +319,81 @@ impl<Zt: ZipTypes, Lc: LinearCode<Zt>> ZipPlus<Zt, Lc> {
         let (q_0, q_1) = point_to_tensor(num_rows, point, field_cfg)?;
 
         let degree_bound = Zt::Comb::DEGREE_BOUND;
-        let batch_size = polys.len();
-        let polys_as_comb_r: Vec<Vec<Zt::CombR>> = polys
-            .iter()
-            .map(|poly| {
-                let alphas = Self::sample_alphas_for_poly(
-                    &mut transcript.fs_transcript,
-                    degree_bound,
-                    batch_size,
-                );
-
-                cfg_iter!(poly.evaluations)
-                    .map(|eval| {
-                        Zt::EvalDotChal::inner_product::<CHECK_FOR_OVERFLOW>(
-                            eval,
-                            &alphas,
-                            Zt::CombR::ZERO,
-                        )
-                        .map_err(ZipError::from)
-                    })
-                    .collect()
-            })
-            .try_collect()?;
-
         let zero_f = F::zero_with_cfg(field_cfg);
 
-        // Compute per-polynomial row dot products, then sum across polynomials.
-        let b = {
+        // One alpha vector per polynomial, drawn in batch order (the
+        // verifier mirrors this in `sample_alphas`).
+        let per_poly_alphas: Vec<Vec<Zt::Chal>> = (0..batch_size)
+            .map(|_| {
+                Self::sample_alphas_for_poly(&mut transcript.fs_transcript, degree_bound, batch_size)
+            })
+            .collect();
+
+        // The alpha-weighted evaluations of one polynomial (its rows, flat).
+        let weighted_rows = |poly: &DenseMultilinearExtension<Zt::Eval>,
+                             alphas: &[Zt::Chal]|
+         -> Result<Vec<Zt::CombR>, ZipError> {
+            cfg_iter!(poly.evaluations)
+                .map(|eval| {
+                    Zt::EvalDotChal::inner_product::<CHECK_FOR_OVERFLOW>(
+                        eval,
+                        alphas,
+                        Zt::CombR::ZERO,
+                    )
+                    .map_err(ZipError::from)
+                })
+                .collect()
+        };
+
+        // `b` (per-row sums across the batch) and the combined row
+        // (`combined_row[col] = Σ_i Σ_j coeffs[j] · poly_i[j · row_len + col]`).
+        let (b, combined_row): (Vec<F>, Vec<Zt::CombR>) = if num_rows == 1 {
+            // Single-row layout: the row-combination coefficient is the
+            // constant 1 and nothing is drawn from the transcript between
+            // `b` and the combined row, so both are accumulated in one
+            // streaming pass — one polynomial's weighted row live at a
+            // time, added into the combined row sequentially, instead of
+            // materializing the whole batch and gathering it column by
+            // column with a `row_len` stride.
+            let mut b0 = zero_f.clone();
+            let mut combined = vec![Zt::CombR::ZERO; row_len];
+            for (j, (poly, alphas)) in polys.iter().zip(per_poly_alphas.iter()).enumerate() {
+                match known_evals {
+                    Some((evals, alpha_to_f)) => {
+                        // b_j = <alpha_j · poly_j, eq(·, point)> = alpha_j · MLE[poly_j](point).
+                        b0 += &(alpha_to_f(&alphas[0]) * &evals[j]);
+                        cfg_iter_mut!(combined)
+                            .zip(cfg_iter!(poly.evaluations))
+                            .try_for_each(|(acc, eval)| -> Result<(), ZipError> {
+                                let scaled = Zt::EvalDotChal::inner_product::<CHECK_FOR_OVERFLOW>(
+                                    eval,
+                                    alphas,
+                                    Zt::CombR::ZERO,
+                                )?;
+                                Self::accumulate::<CHECK_FOR_OVERFLOW>(acc, scaled);
+                                Ok(())
+                            })?;
+                    }
+                    None => {
+                        let row = weighted_rows(poly, alphas)?;
+                        b0 += &MBSInnerProduct::inner_product_field(&row, &q_1, zero_f.clone())?;
+                        cfg_iter_mut!(combined)
+                            .zip(cfg_iter!(row))
+                            .for_each(|(acc, v)| Self::accumulate::<CHECK_FOR_OVERFLOW>(acc, v.clone()));
+                    }
+                }
+            }
+            let b = vec![b0];
+            Self::write_b(transcript, &b, breakdown.as_deref_mut())?;
+            (b, combined)
+        } else {
+            let polys_as_comb_r: Vec<Vec<Zt::CombR>> = polys
+                .iter()
+                .zip(per_poly_alphas.iter())
+                .map(|(poly, alphas)| weighted_rows(poly, alphas))
+                .try_collect()?;
+
+            // Per-polynomial row dot products, summed across polynomials.
             let per_poly_b: Vec<Vec<F>> = cfg_iter!(polys_as_comb_r)
                 .map(|poly_comb_r| {
                     cfg_chunks!(poly_comb_r, row_len)
@@ -287,69 +401,37 @@ impl<Zt: ZipTypes, Lc: LinearCode<Zt>> ZipPlus<Zt, Lc> {
                         .collect::<Result<Vec<F>, _>>()
                 })
                 .collect::<Result<_, _>>()?;
-
             let mut b = vec![zero_f.clone(); num_rows];
             for poly_b in &per_poly_b {
                 b.iter_mut().zip(poly_b).for_each(|(a, d)| *a += d);
             }
-            b
-        };
+            Self::write_b(transcript, &b, breakdown.as_deref_mut())?;
 
-        let pos_b_start = stream_pos(transcript);
-        transcript.write_field_elements(&b)?;
-        let pos_b_end = stream_pos(transcript);
-        if let Some(bd) = breakdown.as_deref_mut() {
-            bd.b.extend_from_slice(&transcript.stream.get_ref()[pos_b_start..pos_b_end]);
-        }
-        // Compute eval = <q_0, b> (inner product in field), <q_2, b> in paper
-        // It is safe to use inner_product_unchecked because we're in a field.
-        let eval = MBSInnerProduct::inner_product::<UNCHECKED>(&q_0, &b, zero_f.clone())?;
-
-        // Matrix-vector product over the flat poly_comb_r layout:
-        // Each poly is a row-major (num_rows x row_len) matrix, and coeffs is the
-        // vector.
-        // combined_row[col] = sum_i sum_j (coeffs[j] * poly_i[j * row_len + col])
-
-        let coeffs = if pp.num_rows == 1 {
-            vec![Zt::Chal::ONE]
-        } else {
-            transcript
+            let coeffs: Vec<Zt::Chal> = transcript
                 .fs_transcript
-                .get_challenges::<Zt::Chal>(num_rows)
-        };
+                .get_challenges::<Zt::Chal>(num_rows);
 
-        let combined_row: Vec<Zt::CombR> = {
+            // Row by row (each row of each polynomial is contiguous), so
+            // the accumulation walks memory sequentially.
             let mut combined = vec![Zt::CombR::ZERO; row_len];
-            cfg_iter_mut!(combined).enumerate().try_for_each(
-                |(col, acc)| -> Result<(), ZipError> {
-                    for poly_comb_r in &polys_as_comb_r {
-                        // Strided access: skip to column `col`, then step by `row_len`
-                        // to pick the col-th entry of each logical row.
-                        for (eval, coeff) in poly_comb_r
-                            .iter()
-                            .skip(col)
-                            .step_by(row_len)
-                            .zip(coeffs.iter())
-                        {
+            for poly_comb_r in &polys_as_comb_r {
+                for (row, coeff) in poly_comb_r.chunks_exact(row_len).zip(coeffs.iter()) {
+                    cfg_iter_mut!(combined)
+                        .zip(cfg_iter!(row))
+                        .for_each(|(acc, eval)| {
                             let scaled: Zt::CombR = eval
                                 .mul_by_scalar::<CHECK_FOR_OVERFLOW>(coeff)
                                 .expect("Cannot multiply evaluation by coefficient");
-                            if CHECK_FOR_OVERFLOW {
-                                *acc = zinc_utils::add!(
-                                    *acc,
-                                    &scaled,
-                                    "Addition overflow while combining rows across polys"
-                                );
-                            } else {
-                                *acc += scaled;
-                            }
-                        }
-                    }
-                    Ok(())
-                },
-            )?;
-            combined
+                            Self::accumulate::<CHECK_FOR_OVERFLOW>(acc, scaled);
+                        });
+                }
+            }
+            (b, combined)
         };
+
+        // Compute eval = <q_0, b> (inner product in field), <q_2, b> in paper
+        // It is safe to use inner_product_unchecked because we're in a field.
+        let eval = MBSInnerProduct::inner_product::<UNCHECKED>(&q_0, &b, zero_f.clone())?;
 
         let pos_cr_start = stream_pos(transcript);
         transcript.write_const_many(&combined_row)?;
@@ -369,6 +451,42 @@ impl<Zt: ZipTypes, Lc: LinearCode<Zt>> ZipPlus<Zt, Lc> {
         }
 
         Ok(eval)
+    }
+
+    /// `acc += v`, overflow-checked when `CHECK_FOR_OVERFLOW`.
+    #[inline(always)]
+    #[allow(clippy::arithmetic_side_effects)]
+    fn accumulate<const CHECK_FOR_OVERFLOW: bool>(acc: &mut Zt::CombR, v: Zt::CombR) {
+        if CHECK_FOR_OVERFLOW {
+            *acc = zinc_utils::add!(
+                *acc,
+                &v,
+                "Addition overflow while combining rows across polys"
+            );
+        } else {
+            *acc += v;
+        }
+    }
+
+    /// Writes the row-evaluation vector `b` to the proof stream (and its
+    /// bytes to `breakdown`, if requested).
+    fn write_b<F>(
+        transcript: &mut PcsProverTranscript,
+        b: &[F],
+        breakdown: Option<&mut ZipPlusProveByteBreakdown>,
+    ) -> Result<(), ZipError>
+    where
+        F: PrimeField,
+        F::Inner: Transcribable,
+        F::Modulus: Transcribable,
+    {
+        let pos_b_start = stream_pos(transcript);
+        transcript.write_field_elements(b)?;
+        let pos_b_end = stream_pos(transcript);
+        if let Some(bd) = breakdown {
+            bd.b.extend_from_slice(&transcript.stream.get_ref()[pos_b_start..pos_b_end]);
+        }
+        Ok(())
     }
 
     /// See [`Self::prove`] for details.

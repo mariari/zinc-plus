@@ -247,3 +247,23 @@ per cell), the GKR layer sumchecks 0.8 s, the CPR constraint closure
   **prove 5.074 → 4.102 s**; verify 21.0 ms and proof bytes identical.
   The `STEPS=1` mode now also prints the int lane's encode / Merkle
   split.
+
+- **Zip+ opening without the per-cell wide-integer → field reduction**
+  (`zip-plus`, `protocol`, `piop`). The profile's largest leaf was
+  `crypto_bigint::Uint::rem` under `MBSInnerProduct::inner_product_field`
+  in `ZipPlus::prove_f`: to send the row sum `b` the prover converted every
+  alpha-weighted cell (`Int<6>`, 4.2M of them) into `F` with a 384-bit
+  division, only to compute `Σ_j alpha_j · MLE[col_j](r*)` — a value it
+  already holds (the `r*` evals it just absorbed). New
+  `ZipPlus::prove_f_with_evals` (single-row scalar lanes only) computes
+  `b = Σ_j F(alpha_j) · evals[j]` directly; the protocol's int-lane opens
+  use it whenever `num_rows == 1`. In the same pass `prove_f` now
+  accumulates the combined row one polynomial at a time (sequential adds
+  into one `row_len` accumulator instead of materializing the whole batch's
+  weighted rows and gathering them with a `row_len` stride), and the int
+  reducer builds `P(x)` / `M(x)` column-by-column over `x` chunks instead of
+  gathering 512 columns per `x`. Step 7: 0.982 → 0.092 s;
+  **prove 4.102 → 2.814 s**; verify 21.1 ms; proof bytes identical (the
+  transcript and every written value are unchanged — this is purely how
+  the honest prover computes them). Tests: protocol / piop / zip-plus
+  suites green.

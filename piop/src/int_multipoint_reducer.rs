@@ -45,7 +45,7 @@ use zinc_poly::{
     utils::{ArithErrors, build_eq_x_r_inner},
 };
 use zinc_transcript::traits::{ConstTranscribable, Transcript};
-use zinc_utils::{cfg_into_iter, cfg_iter, inner_transparent_field::InnerTransparentField};
+use zinc_utils::{cfg_chunks_mut, cfg_iter, inner_transparent_field::InnerTransparentField};
 
 pub use crate::bin_multipoint_reducer::{Proof, Reduced, ReducerError};
 use crate::sumcheck::MLSumcheck;
@@ -92,34 +92,21 @@ where
             assert_eq!(col.evaluations.len(), n_hyper, "int column length must be 2^num_vars");
         }
 
-        // P(x) = Σ_j γ_j · v_j(x) on the hypercube.
-        let p_evals: Vec<F::Inner> = cfg_into_iter!(0..n_hyper)
-            .map(|x_idx| {
-                let mut s = zero.clone();
-                for (j, col) in cols.iter().enumerate() {
-                    let v = F::new_unchecked_with_cfg(col.evaluations[x_idx].clone(), field_cfg);
-                    s = s + &(gammas[j].clone() * &v);
-                }
-                s.into_inner()
-            })
-            .collect();
+        // P(x) = Σ_j γ_j · v_j(x) on the hypercube: accumulated one column
+        // at a time over a chunk of x (each column read contiguously and the
+        // chunk's accumulator cache-resident) rather than one x at a time
+        // across all columns (a `2^num_vars`-strided gather per x).
+        let p_evals: Vec<F::Inner> =
+            weighted_column_sum::<F>(cols, &gammas, n_hyper, field_cfg);
         let p_mle =
             DenseMultilinearExtension::from_evaluations_vec(num_vars, p_evals, zero_inner.clone());
 
-        // M(x) = Σ_t β_t · eq(x, r^(t)) on the hypercube.
+        // M(x) = Σ_t β_t · eq(x, r^(t)) on the hypercube, same layout.
         let eq_tables: Vec<DenseMultilinearExtension<F::Inner>> = cfg_iter!(claims)
             .map(|c| build_eq_x_r_inner::<F>(&c.point, field_cfg).expect("eq build"))
             .collect();
-        let m_evals: Vec<F::Inner> = cfg_into_iter!(0..n_hyper)
-            .map(|x_idx| {
-                let mut s = zero.clone();
-                for (t, eq_t) in eq_tables.iter().enumerate() {
-                    let e_f = F::new_unchecked_with_cfg(eq_t.evaluations[x_idx].clone(), field_cfg);
-                    s = s + &(betas[t].clone() * &e_f);
-                }
-                s.into_inner()
-            })
-            .collect();
+        let m_evals: Vec<F::Inner> =
+            weighted_column_sum::<F>(&eq_tables, &betas, n_hyper, field_cfg);
         let m_mle = DenseMultilinearExtension::from_evaluations_vec(num_vars, m_evals, zero_inner);
 
         let mles = vec![p_mle.clone(), m_mle];
@@ -200,6 +187,39 @@ where
             p_eval: p_at_r_star,
         })
     }
+}
+
+/// `out[x] = Σ_j weights[j] · cols[j][x]` over `x < n`, in chunks of `x`
+/// (parallel across chunks under `parallel`); each column is read
+/// sequentially per chunk.
+#[allow(clippy::arithmetic_side_effects)]
+fn weighted_column_sum<F>(
+    cols: &[DenseMultilinearExtension<F::Inner>],
+    weights: &[F],
+    n: usize,
+    field_cfg: &F::Config,
+) -> Vec<F::Inner>
+where
+    F: InnerTransparentField + Send + Sync,
+    F::Inner: Send + Sync,
+    F::Config: Sync,
+{
+    const CHUNK: usize = 1024;
+    let zero = F::zero_with_cfg(field_cfg);
+    let mut out: Vec<F> = vec![zero; n];
+    cfg_chunks_mut!(out, CHUNK)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let base = chunk_idx * CHUNK;
+            for (col, w) in cols.iter().zip(weights.iter()) {
+                let src = &col.evaluations[base..base + chunk.len()];
+                for (acc, v) in chunk.iter_mut().zip(src.iter()) {
+                    let v = F::new_unchecked_with_cfg(v.clone(), field_cfg);
+                    *acc += &(w.clone() * &v);
+                }
+            }
+        });
+    out.into_iter().map(F::into_inner).collect()
 }
 
 #[allow(clippy::arithmetic_side_effects)]

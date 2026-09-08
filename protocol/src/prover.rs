@@ -34,7 +34,7 @@ use zinc_poly::{
     mle::MultilinearExtensionWithConfig,
     univariate::dynamic::over_field::DynamicPolynomialF,
 };
-use zinc_transcript::traits::{ConstTranscribable, Transcript};
+use zinc_transcript::traits::{ConstTranscribable, Transcribable, Transcript};
 use zinc_uair::{
     LookupTableType, Uair, UairSignature, UairTrace, constraint_counter::count_constraints,
     degree_counter::count_max_degree,
@@ -44,6 +44,7 @@ use zinc_utils::{
     mul_by_scalar::MulByScalar, projectable_to_field::ProjectableToField, sub,
 };
 use zip_plus::{
+    ZipError,
     pcs::{
         ZipPlusProveByteBreakdown,
         multi_zip::MultiZip3,
@@ -1371,24 +1372,35 @@ impl_with_type_bounds!(ProverLifted
                 .fs_transcript
                 .absorb_random_field_slice(&int_evals_r_star, &mut buf);
 
-            let _ = ZipPlus::<Zt::IntZt, Zt::IntLc>::prove_f::<_, CHECK_FOR_OVERFLOW>(
+            open_int_lane::<Zt, F, D, CHECK_FOR_OVERFLOW>(
                 &mut self.base.pcs_transcript,
                 self.base.pp_int,
                 &witness_trace.int,
                 &reduced.point,
                 hint_int,
                 &self.field_cfg,
+                &int_evals_r_star,
             )?;
             (Some(reducer_proof), int_evals_r_star)
         } else {
             if let Some(hint_int) = &self.base.hint_int {
-                let _ = ZipPlus::<Zt::IntZt, Zt::IntLc>::prove_f::<_, CHECK_FOR_OVERFLOW>(
+                let num_total_arb = total.num_arbitrary_poly_cols();
+                let num_pub_int = pub_cols.num_int_cols();
+                let int_offset = add!(add!(num_total_bin, num_total_arb), num_pub_int);
+                let num_wit_int = sub!(total.num_int_cols(), num_pub_int);
+                let zero = F::zero_with_cfg(&self.field_cfg);
+                let r0_evals: Vec<F> = self.lifted_evals[int_offset..add!(int_offset, num_wit_int)]
+                    .iter()
+                    .map(|p| lift_scalar(p, &zero))
+                    .collect();
+                open_int_lane::<Zt, F, D, CHECK_FOR_OVERFLOW>(
                     &mut self.base.pcs_transcript,
                     self.base.pp_int,
                     &witness_trace.int,
                     &self.r_0,
                     hint_int,
                     &self.field_cfg,
+                    &r0_evals,
                 )?;
             }
             (None, Vec::new())
@@ -1409,6 +1421,43 @@ impl_with_type_bounds!(ProverLifted
         })
     }
 });
+
+/// Opens the int lane at `point`. `evals[j]` must be
+/// `MLE[col_j mod q](point)` (the values the verifier binds the opening
+/// to). With the columns committed as single rows the opening's row sum is
+/// `Σ_j alpha_j · evals[j]`, which `ZipPlus::prove_f_with_evals` uses
+/// directly instead of re-deriving it cell by cell through a wide-integer
+/// → field reduction; other layouts take the generic `prove_f`.
+#[allow(clippy::too_many_arguments)]
+fn open_int_lane<Zt, F, const D: usize, const CHECK_FOR_OVERFLOW: bool>(
+    transcript: &mut PcsProverTranscript,
+    pp: &ZipPlusParams<Zt::IntZt, Zt::IntLc>,
+    polys: &[DenseMultilinearExtension<Zt::Int>],
+    point: &[F],
+    hint: &ZipPlusHint<<Zt::IntZt as ZipTypes>::Cw>,
+    field_cfg: &F::Config,
+    evals: &[F],
+) -> Result<F, ZipError>
+where
+    Zt: ZincTypes<D>,
+    F: PrimeField
+        + for<'b> FromWithConfig<&'b <Zt::IntZt as ZipTypes>::CombR>
+        + for<'b> FromWithConfig<&'b Zt::Chal>
+        + for<'b> MulByScalar<&'b F>
+        + FromRef<F>,
+    F::Inner: Transcribable,
+    F::Modulus: Transcribable,
+{
+    if pp.num_rows == 1 {
+        ZipPlus::<Zt::IntZt, Zt::IntLc>::prove_f_with_evals::<F, CHECK_FOR_OVERFLOW>(
+            transcript, pp, polys, point, hint, field_cfg, evals,
+        )
+    } else {
+        ZipPlus::<Zt::IntZt, Zt::IntLc>::prove_f::<F, CHECK_FOR_OVERFLOW>(
+            transcript, pp, polys, point, hint, field_cfg,
+        )
+    }
+}
 
 impl_with_type_bounds!(ProverPcsOpened
 {
