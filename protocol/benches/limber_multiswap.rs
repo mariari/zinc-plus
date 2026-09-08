@@ -7,17 +7,31 @@
 //! magnitude (Int<34>), one real modmul constraint per row.
 //!
 //! Methodology mirrors Limber §7: single-threaded unless the `parallel`
-//! feature is on; medians over N runs; prover time includes commitment;
+//! feature is on; medians over N runs; prover time includes commitment
+//! (witness generation is timed separately and also reported added in);
 //! proof sizes raw + zstd-22.
+//!
+//! Three statements share the harness (env knobs, see `main`):
+//! - the 2048-bit int-cell mock (`WIDE8` / `WIDE16`, optionally `FOLD=1`):
+//!   real `a·b = c + u·N` witnesses in fat `Int<34>` cells, NO range
+//!   checks (a rational witness could satisfy it) — the shape Limber's
+//!   Table 1 row was reconstructed with;
+//! - `LIMB16=1`: the same statement over 16-bit limb columns
+//!   (`4 × 128` int columns per modmul, one modmul per row) with every limb
+//!   range-checked by the `Word { width: 16 }` GKR-LogUp lookup, so the
+//!   witness is provably integral — the sound, apples-to-apples row.
+//!
+//! The projecting prime is drawn from the Fiat–Shamir transcript
+//! (`FIXED_PROJECTING_PRIME = None`): 128-bit at the 100-bit target,
+//! 192-bit under `sec-114` / `sec-128`.
 
 #![allow(clippy::arithmetic_side_effects)]
 
 use crypto_bigint::NonZero;
 use crypto_primitives::{
-    ConstIntRing, ConstIntSemiring, Field, FixedSemiring, FromWithConfig, PrimeField,
-    crypto_bigint_int::Int, crypto_bigint_monty::MontyField, crypto_bigint_uint::Uint,
+    ConstIntRing, ConstIntSemiring, FixedSemiring, PrimeField, crypto_bigint_int::Int,
+    crypto_bigint_uint::Uint,
 };
-use rand::prelude::*;
 use std::{fmt::Debug, hint::black_box, marker::PhantomData, ops::Neg, time::Instant};
 use zinc_poly::{
     ConstCoeffBitWidth, Polynomial,
@@ -25,7 +39,6 @@ use zinc_poly::{
     univariate::{
         binary::{BinaryPoly, BinaryPolyInnerProduct},
         dense::{DensePolyInnerProduct, DensePolynomial},
-        dynamic::over_field::DynamicPolynomialF,
     },
 };
 use zinc_primality::{MillerRabin, PrimalityTest};
@@ -33,8 +46,8 @@ use zinc_protocol::{IntFoldedZincTypes4x, Proof, ZincPlusPiop, ZincTypes};
 use zinc_test_uair::GenerateRandomTrace;
 use zinc_transcript::traits::ConstTranscribable;
 use zinc_uair::{
-    ConstraintBuilder, PublicColumnLayout, TotalColumnLayout, TraceRow, Uair, UairSignature,
-    UairTrace,
+    ConstraintBuilder, LookupColumnSpec, LookupTableType, PublicColumnLayout, TotalColumnLayout,
+    TraceRow, Uair, UairSignature, UairTrace,
     ideal::ImpossibleIdeal,
     ideal_collector::IdealOrZero,
 };
@@ -313,7 +326,14 @@ where
 //
 
 const DEGREE_PLUS_ONE: usize = 32;
-const FIELD_LIMBS: usize = 4;
+
+/// Width of the transcript-drawn projecting prime, in 64-bit limbs. Every
+/// Fiat–Shamir soundness term is `O(size / prime)`: the fingerprinting
+/// (random-prime) step spends `≈ (bits of the largest constraint residue,
+/// ~2^13 here) / prime`, and the range-check LogUp spends
+/// `≈ (#looked-up cells + table size, ~2^22) / prime`, so 128 bits leaves
+/// > 100 bits at the default target and 192 bits is used above it.
+const FIELD_LIMBS: usize = if SECURITY_BITS > 100 { 3 } else { 2 };
 
 zinc_utils::define_modulus!(LimberBenchSlot, FIELD_LIMBS);
 type F = Fp<LimberBenchSlot, FIELD_LIMBS>;
@@ -614,6 +634,161 @@ impl GenerateRandomTrace<DEGREE_PLUS_ONE> for RsaModMulWide16Uair {
 }
 
 //
+// Limb statement: 16-bit limb columns + Word(16) range-check lookups.
+//
+// a·b = c + u·N with a, b, c, u each given as 128 little-endian 16-bit limbs
+// in their own int columns (512 columns, one modmul per row). Every limb
+// column carries a `Word { width: 16 }` lookup, so each cell is a proven
+// integer in [0, 2^16) and hence each value a proven integer in
+// [0, 2^2048) — the witness is integral, unlike the fat-cell mock above.
+// The values are recombined by Horner inside the constraint, so the only
+// scalars are 2^16 and the 16-bit limbs of N.
+//
+
+const LIMB_BITS: u32 = 16;
+const LIMBS_PER_VALUE: usize = 2048 / LIMB_BITS as usize; // 128
+const LIMB_COLS: usize = 4 * LIMBS_PER_VALUE; // a | b | c | u
+const LIMB_INT: usize = 1; // one 64-bit limb per 16-bit cell (sign headroom included)
+const LIMB_CW: usize = 3; // codeword growth of the IPRS encoder
+const LIMB_M: usize = 6; // combination ring: Cw + 128-bit alphas/coeffs + row sums
+
+type LimbInt = Int<LIMB_INT>;
+
+type RsaLimbZincTypes = GenericBenchZincTypes<
+    /* Int         = */ LimbInt,
+    /* CwR         = */ Int<LIMB_CW>,
+    /* Chal        = */ i128,
+    /* Pt          = */ i128,
+    /* BinaryCombR = */ Int<5>,
+    /* CombR       = */ Int<LIMB_M>,
+    /* IntCombR    = */ Int<LIMB_M>,
+    /* Fmod        = */ Uint<FIELD_LIMBS>,
+    MillerRabin,
+    DEGREE_PLUS_ONE,
+>;
+
+/// The 128 little-endian 16-bit limbs of N = 2^2048 − 59.
+fn modulus_limbs16() -> [i64; LIMBS_PER_VALUE] {
+    let n = modulus_raw();
+    let words = n.as_words();
+    core::array::from_fn(|i| ((words[i / 4] >> (16 * (i % 4))) & 0xFFFF) as i64)
+}
+
+fn limb_int(v: u64) -> LimbInt {
+    *Uint::<LIMB_INT>::new(crypto_bigint::Uint::<LIMB_INT>::from_u64(v)).as_int()
+}
+
+/// Little-endian 16-bit limbs of a 4096-bit-capable value (only the low
+/// 2048 bits are used).
+fn limbs16(v: &crypto_bigint::Uint<64>) -> [u64; LIMBS_PER_VALUE] {
+    let words = v.as_words();
+    core::array::from_fn(|i| (words[i / 4] >> (16 * (i % 4))) & 0xFFFF)
+}
+
+#[derive(Clone, Debug)]
+pub struct RsaModMulLimbUair;
+
+impl Uair for RsaModMulLimbUair {
+    type Ideal = ImpossibleIdeal;
+    /// Degree-0 scalars: the radix 2^16 and the limbs of N.
+    type Scalar = DensePolynomial<i64, 1>;
+
+    fn signature() -> UairSignature {
+        let total = TotalColumnLayout::new(0, 0, LIMB_COLS);
+        let lookup_specs: Vec<LookupColumnSpec> = (0..LIMB_COLS)
+            .map(|i| LookupColumnSpec {
+                column_index: i,
+                table_type: LookupTableType::Word { width: LIMB_BITS as usize, chunk_width: None },
+            })
+            .collect();
+        UairSignature::new(total, PublicColumnLayout::default(), vec![], lookup_specs, vec![])
+    }
+
+    fn constrain_general<B, FromR, MulByScalar, IFromR>(
+        b: &mut B,
+        up: TraceRow<B::Expr>,
+        _down: TraceRow<B::Expr>,
+        _from_ref: FromR,
+        mbs: MulByScalar,
+        _ideal_from_ref: IFromR,
+    ) where
+        B: ConstraintBuilder,
+        FromR: Fn(&Self::Scalar) -> B::Expr,
+        MulByScalar: Fn(&B::Expr, &Self::Scalar) -> Option<B::Expr>,
+        IFromR: Fn(&Self::Ideal) -> B::Ideal,
+    {
+        let radix = DensePolynomial::<i64, 1>::new([1i64 << LIMB_BITS]);
+        // value = Σ_i 2^{16 i} · limb_i, Horner from the top limb down.
+        let value = |base: usize| -> B::Expr {
+            let mut acc = up.int[base + LIMBS_PER_VALUE - 1].clone();
+            for i in (0..LIMBS_PER_VALUE - 1).rev() {
+                acc = mbs(&acc, &radix).expect("radix mul") + &up.int[base + i];
+            }
+            acc
+        };
+        let a = value(0);
+        let bb = value(LIMBS_PER_VALUE);
+        let c = value(2 * LIMBS_PER_VALUE);
+        let u = value(3 * LIMBS_PER_VALUE);
+
+        // u·N = Σ_i n_i · 2^{16 i} · u, Horner over the limbs n_i of N.
+        let n_limbs = modulus_limbs16();
+        let n_scalar = |i: usize| DensePolynomial::<i64, 1>::new([n_limbs[i]]);
+        let mut un = mbs(&u, &n_scalar(LIMBS_PER_VALUE - 1)).expect("n mul");
+        for i in (0..LIMBS_PER_VALUE - 1).rev() {
+            un = mbs(&un, &radix).expect("radix mul") + &mbs(&u, &n_scalar(i)).expect("n mul");
+        }
+
+        b.assert_zero(a * &bb - &c - &un);
+    }
+}
+
+impl GenerateRandomTrace<DEGREE_PLUS_ONE> for RsaModMulLimbUair {
+    type PolyCoeff = LimbInt;
+    type Int = LimbInt;
+
+    fn generate_random_trace<Rng: rand::RngCore + ?Sized>(
+        num_vars: usize,
+        rng: &mut Rng,
+    ) -> UairTrace<'static, LimbInt, LimbInt, DEGREE_PLUS_ONE> {
+        let len = 1usize << num_vars;
+        let n32 = modulus_raw();
+        let nz32: NonZero<crypto_bigint::Uint<32>> =
+            Option::from(NonZero::new(n32)).expect("N != 0");
+        let n64 = n32.resize::<64>();
+        let nz64: NonZero<crypto_bigint::Uint<64>> =
+            Option::from(NonZero::new(n64)).expect("N != 0");
+
+        let mut cols: Vec<Vec<LimbInt>> = (0..LIMB_COLS).map(|_| Vec::with_capacity(len)).collect();
+        for _ in 0..len {
+            let mut rand32 = |rng: &mut Rng| -> crypto_bigint::Uint<32> {
+                crypto_bigint::Uint::<32>::from_words(core::array::from_fn(|_| rng.next_u64()))
+            };
+            let a = rand32(rng).div_rem(&nz32).1;
+            let b = rand32(rng).div_rem(&nz32).1;
+            let a64 = a.resize::<64>();
+            let b64 = b.resize::<64>();
+            let (lo, _hi) = a64.widening_mul(&b64);
+            let (u, c) = lo.div_rem(&nz64);
+            for (k, v) in [a64, b64, c.resize::<64>(), u].iter().enumerate() {
+                for (i, limb) in limbs16(v).into_iter().enumerate() {
+                    cols[k * LIMBS_PER_VALUE + i].push(limb_int(limb));
+                }
+            }
+        }
+
+        UairTrace {
+            int: cols
+                .into_iter()
+                .map(|v| v.into_iter().collect::<DenseMultilinearExtension<_>>())
+                .collect::<Vec<_>>()
+                .into(),
+            ..Default::default()
+        }
+    }
+}
+
+//
 // Folded-4× instantiation: Int<34> cells quartered at radix 2^512
 // (generalized from the 2^64 ECDSA quartering) into Int<9> quarters
 // (512 magnitude bits + one sign-headroom limb).
@@ -709,16 +884,20 @@ fn ncols_label(n: usize) -> &'static str {
     match n {
         8 => "wide8",
         16 => "wide16",
+        512 => "limb16",
         _ => "",
     }
 }
 
 macro_rules! run_case_for {
     ($ufn:ident, $uty:ty, $ncols:literal) => {
+        run_case_for!($ufn, $uty, RsaZincTypes, $ncols, "");
+    };
+    ($ufn:ident, $uty:ty, $zt:ty, $ncols:literal, $tag:literal) => {
 #[allow(clippy::unwrap_used)]
 fn $ufn(num_vars: usize, reps: usize) {
     type U = $uty;
-    type Zt = RsaZincTypes;
+    type Zt = $zt;
     macro_rules! piop {
         () => {
             ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>
@@ -797,21 +976,25 @@ fn $ufn(num_vars: usize, reps: usize) {
                 verify_once(p).expect("verify failed");
                 verify_times.push(t0.elapsed().as_secs_f64());
             }
+            let prove_med = median(prove_times);
             println!(
-                "RsaModMul2048[main-beta]{}/rate1-{REP} nvars={num_vars} ({} rows x {} cols, row_len={row_len}): witness-gen {:.3} s | prove median {:.3} s | verify median {:.4} s ({} reps)",
+                "RsaModMul2048[main-beta]{}{}/rate1-{REP}/sec{SECURITY_BITS} nvars={num_vars} ({} rows x {} cols, row_len={row_len}): witness-gen {:.3} s | prove median {:.3} s | prove+witgen {:.3} s | verify median {:.4} s ({} reps)",
                 ncols_label($ncols),
+                $tag,
                 1usize << num_vars,
                 $ncols,
                 witness_gen_s,
-                median(prove_times),
+                prove_med,
+                prove_med + witness_gen_s,
                 median(verify_times),
                 reps,
             );
         }
         Err(e) => {
             println!(
-                "RsaModMul2048[main-beta]{}/rate1-{REP} nvars={num_vars} ({} rows x {} cols, row_len={row_len}): witness-gen {:.3} s | prove median {:.3} s | VERIFY FAILED: {e:?} ({} reps)",
+                "RsaModMul2048[main-beta]{}{}/rate1-{REP}/sec{SECURITY_BITS} nvars={num_vars} ({} rows x {} cols, row_len={row_len}): witness-gen {:.3} s | prove median {:.3} s | VERIFY FAILED: {e:?} ({} reps)",
                 ncols_label($ncols),
+                $tag,
                 1usize << num_vars,
                 $ncols,
                 witness_gen_s,
@@ -823,8 +1006,9 @@ fn $ufn(num_vars: usize, reps: usize) {
 
     eprint_proof_size(
         format!(
-            "RsaModMul2048[main-beta]{}/rate1-{REP}/nvars={num_vars}/row_len={row_len}",
-            ncols_label($ncols)
+            "RsaModMul2048[main-beta]{}{}/rate1-{REP}/sec{SECURITY_BITS}/nvars={num_vars}/row_len={row_len}",
+            ncols_label($ncols),
+            $tag
         ),
         &proof,
     );
@@ -835,6 +1019,7 @@ fn $ufn(num_vars: usize, reps: usize) {
 run_case_for!(run_case, RsaModMulUair, 4);
 run_case_for!(run_case_wide8, RsaModMulWideUair, 8);
 run_case_for!(run_case_wide16, RsaModMulWide16Uair, 16);
+run_case_for!(run_case_limb16, RsaModMulLimbUair, RsaLimbZincTypes, 512, "/limb16+rangecheck");
 
 macro_rules! run_case_folded_for {
     ($ufn:ident, $uty:ty, $ncols:literal) => {
@@ -928,20 +1113,22 @@ fn $ufn(num_vars: usize, reps: usize) {
                 verify_once(p).expect("verify failed");
                 verify_times.push(t0.elapsed().as_secs_f64());
             }
+            let prove_med = median(prove_times);
             println!(
-                "RsaModMul2048[main-beta]{}/folded4x/rate1-{REP} nvars={num_vars} ({} rows x {} cols, split4_row_len={split4_size}): witness-gen {:.3} s | prove median {:.3} s | verify median {:.4} s ({} reps)",
+                "RsaModMul2048[main-beta]{}/folded4x/rate1-{REP}/sec{SECURITY_BITS} nvars={num_vars} ({} rows x {} cols, split4_row_len={split4_size}): witness-gen {:.3} s | prove median {:.3} s | prove+witgen {:.3} s | verify median {:.4} s ({} reps)",
                 ncols_label($ncols),
                 1usize << num_vars,
                 $ncols,
                 witness_gen_s,
-                median(prove_times),
+                prove_med,
+                prove_med + witness_gen_s,
                 median(verify_times),
                 reps,
             );
         }
         Err(e) => {
             println!(
-                "RsaModMul2048[main-beta]{}/folded4x/rate1-{REP} nvars={num_vars} ({} rows x {} cols, split4_row_len={split4_size}): witness-gen {:.3} s | prove median {:.3} s | VERIFY FAILED: {e:?} ({} reps)",
+                "RsaModMul2048[main-beta]{}/folded4x/rate1-{REP}/sec{SECURITY_BITS} nvars={num_vars} ({} rows x {} cols, split4_row_len={split4_size}): witness-gen {:.3} s | prove median {:.3} s | VERIFY FAILED: {e:?} ({} reps)",
                 ncols_label($ncols),
                 1usize << num_vars,
                 $ncols,
@@ -954,7 +1141,7 @@ fn $ufn(num_vars: usize, reps: usize) {
 
     eprint_proof_size(
         format!(
-            "RsaModMul2048[main-beta]{}/folded4x/rate1-{REP}/nvars={num_vars}/split4_row_len={split4_size}",
+            "RsaModMul2048[main-beta]{}/folded4x/rate1-{REP}/sec{SECURITY_BITS}/nvars={num_vars}/split4_row_len={split4_size}",
             ncols_label($ncols)
         ),
         &proof,
@@ -972,17 +1159,20 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
+    let limb16 = std::env::var("LIMB16").is_ok();
     let nvars_list: Vec<usize> = std::env::var("NVARS")
         .ok()
         .map(|s| s.split(',').map(|x| x.parse().expect("bad NVARS")).collect())
-        .unwrap_or_else(|| vec![12]);
+        .unwrap_or_else(|| vec![if limb16 { 13 } else { 12 }]);
 
     eprintln!(
-        "single-threaded={} checks={} rate=1/{} openings={} (features: parallel={}, unchecked={})",
+        "single-threaded={} checks={} rate=1/{} security={} bits openings={} projecting-prime=transcript-drawn {}-bit (features: parallel={}, unchecked={})",
         cfg!(not(feature = "parallel")),
         PERFORM_CHECKS,
         REP,
+        SECURITY_BITS,
         NUM_COL_OPENINGS_FOR_REP,
+        64 * FIELD_LIMBS,
         cfg!(feature = "parallel"),
         cfg!(feature = "unchecked"),
     );
@@ -990,6 +1180,12 @@ fn main() {
     let wide16 = std::env::var("WIDE16").is_ok();
     let folded = std::env::var("FOLD").is_ok();
     for nv in nvars_list {
+        if limb16 {
+            // Range-checked 16-bit-limb statement: 512 int columns, one
+            // modmul per row (nvars = 13 ⇔ 8192 modmuls ⊇ 6,209).
+            run_case_limb16(nv, reps);
+            continue;
+        }
         match (folded, wide16, wide8) {
             (true, true, _) => run_case_folded_wide16(nv, reps),
             (true, false, true) => run_case_folded_wide8(nv, reps),
