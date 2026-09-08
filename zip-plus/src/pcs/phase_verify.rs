@@ -407,14 +407,35 @@ impl<Zt: ZipTypes, Lc: LinearCode<Zt>> ZipPlus<Zt, Lc> {
     ) -> Vec<Vec<Zt::Chal>> {
         let degree_bound = Zt::Comb::DEGREE_BOUND;
         (0..batch_size)
-            .map(|_| {
-                if degree_bound.is_zero() {
-                    vec![Zt::Chal::ONE]
-                } else {
-                    transcript.get_challenges(add!(degree_bound, 1))
-                }
-            })
+            .map(|_| Self::sample_alphas_for_poly(transcript, degree_bound, batch_size))
             .collect()
+    }
+
+    /// The alpha vector of one polynomial in a batch of `batch_size`.
+    ///
+    /// Polynomial-valued lanes get `degree_bound + 1` fresh challenges
+    /// (the `X`-coefficient projection weights). Scalar lanes
+    /// (`degree_bound = 0`) get `[1]` when they are opened alone — so the
+    /// opening value is the plain evaluation — but a fresh random weight
+    /// when batched: the batch is folded by summing the per-polynomial
+    /// rows (`b`, `combined_row`, column entries), so the weight is what
+    /// binds *each* polynomial's evaluation rather than only the sum of
+    /// the batch's evaluations. Must be called in the same order by the
+    /// prover and the verifier (one call per polynomial, in batch order).
+    pub fn sample_alphas_for_poly(
+        transcript: &mut Blake3Transcript,
+        degree_bound: usize,
+        batch_size: usize,
+    ) -> Vec<Zt::Chal> {
+        if degree_bound.is_zero() {
+            if batch_size == 1 {
+                vec![Zt::Chal::ONE]
+            } else {
+                vec![transcript.get_challenge()]
+            }
+        } else {
+            transcript.get_challenges(add!(degree_bound, 1))
+        }
     }
 
     // Check 3: Enc(w)[col] == sum_i( sum_j( s_j * <v_ij[col], alphas_i> ) )
@@ -492,7 +513,7 @@ mod tests {
         univariate::binary::BinaryPoly,
     };
     use zinc_transcript::traits::{ConstTranscribable, Transcribable, Transcript};
-    use zinc_utils::CHECKED;
+    use zinc_utils::{CHECKED, from_ref::FromRef};
 
     const INT_LIMBS: usize = U64::LIMBS;
 
@@ -1538,5 +1559,102 @@ mod tests {
             &tampered_eval,
         );
         assert!(res.is_err(), "Should fail when eval is tampered");
+    }
+
+    /// Regression test for the per-polynomial binding of a batched scalar
+    /// opening. The batch is folded by *summing* the per-polynomial rows,
+    /// so with unit alphas an opening only bound the SUM of the batch's
+    /// evaluations: a prover could move evaluation mass from one polynomial
+    /// to another (`e_1 + δ`, `e_2 − δ`) undetected. With one random alpha
+    /// per batched scalar polynomial the alpha-weighted claim changes and
+    /// the evaluation-consistency check must reject it — while the honest
+    /// per-polynomial evaluations, combined with the same alphas, verify.
+    #[test]
+    fn batched_verify_rejects_evaluation_mass_transfer() {
+        let num_vars = 10;
+        let poly_size = 1 << num_vars;
+        let pp = TestZip::setup(poly_size, C.clone());
+
+        let polys: Vec<DenseMultilinearExtension<_>> = vec![
+            (1..=poly_size as i32).map(Int::from).collect(),
+            (17..=16 + poly_size as i32).map(Int::from).collect(),
+        ];
+
+        let (hint, comm) = TestZip::commit(&pp, &polys).unwrap();
+        let point: Vec<<Zt as ZipTypes>::Pt> = (0..num_vars).map(|i| Int::from(i + 2)).collect();
+
+        let mut prover_transcript = PcsProverTranscript::new_from_commitment(&comm);
+        let field_cfg = get_field_cfg::<PolyZt, F>(&mut prover_transcript.fs_transcript);
+
+        let eval_f = TestZip::prove::<F, CHECKED>(
+            &mut prover_transcript,
+            &pp,
+            &polys,
+            &point,
+            &hint,
+            &field_cfg,
+        )
+        .unwrap();
+
+        // Honest per-polynomial evaluations, lifted to F.
+        let per_poly_evals: Vec<F> = polys
+            .iter()
+            .map(|poly| {
+                let wide: DenseMultilinearExtension<Int<M>> =
+                    poly.evaluations.iter().map(Int::from_ref).collect();
+                let e = wide.evaluate(&point, Zero::zero()).unwrap();
+                (&e).into_with_cfg(&field_cfg)
+            })
+            .collect();
+        let point_f: Vec<F> = point.iter().map(|v| v.into_with_cfg(&field_cfg)).collect();
+
+        // Run the verifier twice from the same proof: once with the honest
+        // per-polynomial evaluations, once with mass moved between them.
+        let run = |claimed: &dyn Fn(&[F], &[Vec<<Zt as ZipTypes>::Chal>]) -> F| {
+            let mut verifier_transcript = prover_transcript.clone().into_verification_transcript();
+            verifier_transcript.fs_transcript.absorb_slice(&comm.root);
+            let field_cfg = get_field_cfg::<Zt, F>(&mut verifier_transcript.fs_transcript);
+            let alphas = TestZip::sample_alphas(&mut verifier_transcript.fs_transcript, polys.len());
+            let claimed_eval = claimed(&per_poly_evals, &alphas);
+            TestZip::verify_with_alphas::<_, CHECKED>(
+                &mut verifier_transcript,
+                &pp,
+                &comm,
+                &field_cfg,
+                &point_f,
+                &claimed_eval,
+                &alphas,
+            )
+        };
+        let weighted = |evals: &[F], alphas: &[Vec<<Zt as ZipTypes>::Chal>]| -> F {
+            evals
+                .iter()
+                .zip(alphas)
+                .fold(F::zero_with_cfg(&field_cfg), |acc, (e, a)| {
+                    let a_f: F = (&a[0]).into_with_cfg(&field_cfg);
+                    acc + a_f * e
+                })
+        };
+
+        let honest = run(&|evals, alphas| weighted(evals, alphas));
+        assert!(honest.is_ok(), "honest per-polynomial evals must verify: {honest:?}");
+        // The prover's returned opening value is exactly that weighted sum.
+        {
+            let mut t = prover_transcript.clone().into_verification_transcript();
+            t.fs_transcript.absorb_slice(&comm.root);
+            let _ = get_field_cfg::<Zt, F>(&mut t.fs_transcript);
+            let alphas = TestZip::sample_alphas(&mut t.fs_transcript, polys.len());
+            assert_eq!(weighted(&per_poly_evals, &alphas), eval_f);
+        }
+
+        let delta = F::from_with_cfg(12345u64, &field_cfg);
+        let moved = run(&|evals, alphas| {
+            let shifted = vec![evals[0].clone() + &delta, evals[1].clone() - &delta];
+            weighted(&shifted, alphas)
+        });
+        assert!(
+            moved.is_err(),
+            "moving evaluation mass between batched polynomials must be rejected"
+        );
     }
 }

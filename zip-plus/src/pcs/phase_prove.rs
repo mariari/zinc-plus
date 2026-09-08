@@ -72,7 +72,12 @@ impl<Zt: ZipTypes, Lc: LinearCode<Zt>> ZipPlus<Zt, Lc> {
     /// 2. Per polynomial, samples random challenges `alphas` (`[α_0, …, α_d]`).
     ///    For each decoded row `w_j` takes the inner product `<entry, alphas>`
     ///    of every entry in the row, producing `w'_j` — a row of `CombR`
-    ///    integers.
+    ///    integers. For scalar lanes (`degree_bound = 0`) a batch of more
+    ///    than one polynomial still gets one random `α_0` per polynomial: the
+    ///    batch is folded by *summing* the `w'_j`, so without per-polynomial
+    ///    weights the opening would only bind the sum of the batch's
+    ///    evaluations, not each polynomial's (a single scalar polynomial keeps
+    ///    `α_0 = 1`, so its opening value is its plain evaluation).
     /// 3. Computes `b` (length `num_rows`), accumulated across all polys: `b_j
     ///    += <w'_j, q_1>` for each row `j`.
     /// 4. Writes `b` to the transcript and computes `eval = <q_0, b>`.
@@ -248,14 +253,15 @@ impl<Zt: ZipTypes, Lc: LinearCode<Zt>> ZipPlus<Zt, Lc> {
         let (q_0, q_1) = point_to_tensor(num_rows, point, field_cfg)?;
 
         let degree_bound = Zt::Comb::DEGREE_BOUND;
+        let batch_size = polys.len();
         let polys_as_comb_r: Vec<Vec<Zt::CombR>> = polys
             .iter()
             .map(|poly| {
-                let alphas = if degree_bound.is_zero() {
-                    vec![Zt::Chal::ONE]
-                } else {
-                    transcript.fs_transcript.get_challenges(degree_bound + 1)
-                };
+                let alphas = Self::sample_alphas_for_poly(
+                    &mut transcript.fs_transcript,
+                    degree_bound,
+                    batch_size,
+                );
 
                 cfg_iter!(poly.evaluations)
                     .map(|eval| {
@@ -434,14 +440,15 @@ impl<Zt: ZipTypes, Lc: LinearCode<Zt>> ZipPlus<Zt, Lc> {
         let (q_0, q_1) = point_to_tensor(num_rows, point, field_cfg)?;
 
         let degree_bound = Zt::Comb::DEGREE_BOUND;
+        let batch_size = polys.len();
         let polys_as_comb_r: Vec<Vec<Zt::CombR>> = polys
             .iter()
             .map(|poly| {
-                let alphas = if degree_bound.is_zero() {
-                    vec![Zt::Chal::ONE]
-                } else {
-                    transcript.fs_transcript.get_challenges(degree_bound + 1)
-                };
+                let alphas = Self::sample_alphas_for_poly(
+                    &mut transcript.fs_transcript,
+                    degree_bound,
+                    batch_size,
+                );
                 cfg_iter!(poly.evaluations)
                     .map(|eval| {
                         Zt::EvalDotChal::inner_product::<CHECK_FOR_OVERFLOW>(
