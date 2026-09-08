@@ -183,6 +183,11 @@ fn hash_column<S: ConstTranscribable>(values: &[S]) -> MtHash {
 /// buffer and feeds it to Blake3 in one `update` call.  This lets Blake3
 /// process full 1 KiB chunks with SIMD, which is significantly faster than
 /// the per-element `update` approach when columns are tall (many rows).
+///
+/// Columns are gathered in blocks of [`LEAF_BLOCK`]: every source row is
+/// then read in contiguous runs of `LEAF_BLOCK` elements (instead of one
+/// element per column, `row_width` elements apart) and the block's
+/// transposed bytes stay cache-resident while its columns are hashed.
 #[allow(clippy::arithmetic_side_effects)]
 fn hash_leaves<S>(rows: &[&[S]], m_cols: usize) -> Vec<MtHash>
 where
@@ -191,20 +196,35 @@ where
     let num_rows = rows.len();
     let elem_bytes = S::NUM_BYTES;
     let col_bytes = num_rows * elem_bytes;
+    let num_blocks = m_cols.div_ceil(LEAF_BLOCK);
 
-    cfg_into_iter!(0..m_cols)
-        .map(|i| {
-            let mut buf = vec![0_u8; col_bytes];
+    let per_block: Vec<Vec<MtHash>> = cfg_into_iter!(0..num_blocks)
+        .map(|blk| {
+            let c0 = blk * LEAF_BLOCK;
+            let width = LEAF_BLOCK.min(m_cols - c0);
+            // Column `c` of the block occupies `buf[c * col_bytes..][..col_bytes]`.
+            let mut buf = vec![0_u8; width * col_bytes];
             for (r, row) in rows.iter().enumerate() {
-                let start = r * elem_bytes;
-                row[i].write_transcription_bytes_exact(&mut buf[start..start + elem_bytes]);
+                let row_off = r * elem_bytes;
+                for (c, v) in row[c0..c0 + width].iter().enumerate() {
+                    let start = c * col_bytes + row_off;
+                    v.write_transcription_bytes_exact(&mut buf[start..start + elem_bytes]);
+                }
             }
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(&buf);
-            hasher.finalize().into()
+            buf.chunks_exact(col_bytes)
+                .map(|col| {
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(col);
+                    hasher.finalize().into()
+                })
+                .collect()
         })
-        .collect()
+        .collect();
+    per_block.into_iter().flatten().collect()
 }
+
+/// Number of columns gathered per block in [`hash_leaves`].
+const LEAF_BLOCK: usize = 64;
 
 /// Construct Merkle leaves over three groups of heterogeneous rows.
 ///
