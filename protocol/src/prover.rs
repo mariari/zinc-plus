@@ -1146,11 +1146,32 @@ impl_with_type_bounds!(ProverMultipointEvaled
         // (after \phi_q but before \psi_a). The verifier derives the scalar
         // open_evals via \psi_a for the sumcheck consistency check, and
         // supplies these to the Zip+ PCS for alpha-projection.
-        let lifted_evals = compute_lifted_evals::<F, D>(
+        // Binary / arbitrary-poly columns: polynomial-valued lifts from the
+        // row-major trace. Int columns: their lift is the scalar MLE
+        // evaluation of the projected column, computed on the column-major
+        // F-projected trace (`compute_int_column_evals`, one contiguous
+        // pass per column) instead of walking the row-major trace of
+        // heap-allocated cells column by column.
+        let total = self.base.uair_signature.total_cols();
+        let n_bin = total.num_binary_poly_cols();
+        let n_arb = total.num_arbitrary_poly_cols();
+        let n_int = total.num_int_cols();
+        let mut lifted_evals = compute_lifted_evals_capped::<F, D>(
             &self.r_0,
             &self.base.trace.binary_poly,
             &self.projected_trace,
             &self.field_cfg,
+            Some(n_arb),
+        );
+        let int_start = add!(n_bin, n_arb);
+        let int_cols: Vec<&DenseMultilinearExtension<F::Inner>> = self.projected_trace_f
+            [int_start..add!(int_start, n_int)]
+            .iter()
+            .collect();
+        lifted_evals.extend(
+            compute_int_column_evals::<F>(&int_cols, &self.r_0, &self.field_cfg)
+                .into_iter()
+                .map(|e| DynamicPolynomialF::new_trimmed(vec![e])),
         );
 
         let mut transcription_buf: Vec<u8> = vec![0; F::Inner::NUM_BYTES];

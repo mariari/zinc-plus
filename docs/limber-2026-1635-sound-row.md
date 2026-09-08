@@ -282,3 +282,23 @@ per cell), the GKR layer sumchecks 0.8 s, the CPR constraint closure
   round polynomials and transcript interaction, so the verifier is
   untouched. Step 4b: 0.821 → 0.456 s; **prove 2.814 → 2.631 s**; verify
   20.9 ms; proof bytes identical. Tests: piop + protocol suites green.
+
+- **Step-6 int lifts on the projected column-major trace**
+  (`protocol/src/prover.rs::step6_lift_and_project`). The lifted evals
+  at `r_0` walked the row-major trace of heap-allocated `F_q[X]` cells
+  column by column (two passes per column, one to find the degree) even
+  though an int column's lift is a scalar; int columns now go through
+  `compute_int_column_evals` on the already-projected column-major
+  Montgomery MLEs (one contiguous pass per column), binary / arbitrary
+  columns are unchanged. Step 6: 0.162 → 0.050 s (LTO off); proof
+  bytes identical (the same degree-0 lifts are absorbed).
+
+- **Blocked Merkle leaf gather** (`zip-plus/src/merkle.rs::hash_leaves`):
+  leaves are gathered 64 columns at a time so each codeword row is read
+  in contiguous runs instead of one 16-byte element per column with a
+  1 MB stride, and one buffer serves 64 leaves instead of one allocation
+  per leaf. Int-lane Merkle 0.39–0.41 → 0.34 s (LTO off). Modest: the
+  remaining time is Blake3 over the 512 MB of codeword bytes
+  (`blake3_hash_many_neon` ≈ 0.18 s) plus the per-leaf hasher overhead,
+  so the next lever here is a narrower codeword serialization, not the
+  gather.
