@@ -267,3 +267,18 @@ per cell), the GKR layer sumchecks 0.8 s, the CPR constraint closure
   transcript and every written value are unchanged — this is purely how
   the honest prover computes them). Tests: protocol / piop / zip-plus
   suites green.
+
+- **Eq-factored GKR layer sumchecks** (`piop/src/lookup/gkr_logup/gkr.rs`,
+  new `layer_sumcheck_prove`, used by both the batched and the single-tree
+  GKR provers). Each of the 22 witness-tree layers ran the generic
+  closure-based sumcheck driver on `[eq, pla, ql, pr, qr]` at degree 3:
+  four `comb_fn` calls per hypercube pair (each `eq · (pla·qr + pr·ql) · δ⁰`),
+  five arrays folded per round, and a 2^k clone of every layer into MLEs.
+  The specialised prover keeps `eq` out of the fold
+  (`eq(x, r) = E_{i-1} · eq(X, r_i) · eq(x', r_{>i})`), evaluates only
+  the degree-2 inner sum at `X ∈ {0, 1, 2}` (three `h` evaluations per
+  pair, `H(3)` by extrapolation), folds four arrays, and skips the `δ^ℓ`
+  multiply (weighting per-tree sums once). It emits exactly the same
+  round polynomials and transcript interaction, so the verifier is
+  untouched. Step 4b: 0.821 → 0.456 s; **prove 2.814 → 2.631 s**; verify
+  20.9 ms; proof bytes identical. Tests: piop + protocol suites green.

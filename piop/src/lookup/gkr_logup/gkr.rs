@@ -25,14 +25,14 @@ use crypto_primitives::{FromPrimitiveWithConfig, PrimeField};
 use num_traits::Zero;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
-use zinc_poly::{
-    mle::DenseMultilinearExtension,
-    utils::build_eq_x_r_inner,
-};
+use zinc_poly::utils::build_eq_x_r_vec;
 use zinc_transcript::traits::{ConstTranscribable, Transcript};
 use zinc_utils::{cfg_into_iter, inner_transparent_field::InnerTransparentField};
 
-use crate::sumcheck::MLSumcheck;
+use crate::sumcheck::{
+    MLSumcheck, SumcheckProof,
+    prover::{NatEvaluatedPolyWithoutConstant, ProverMsg},
+};
 
 use super::structs::{
     BatchedGkrFractionProof, BatchedGkrLayerProof,
@@ -259,6 +259,228 @@ pub(super) fn evaluate_mle_at<F: InnerTransparentField>(
 
 /// Run the GKR prover for a single fractional sumcheck.
 ///
+// ---------------------------------------------------------------------------
+// Layer sumcheck prover (eq-factored)
+// ---------------------------------------------------------------------------
+
+/// Prover of one GKR layer's (batched) sumcheck, specialised to its shape
+///
+/// ```text
+///   Σ_{x ∈ {0,1}^k} eq(x, r) · Σ_ℓ δ^ℓ · (pla_ℓ(x) · qr_ℓ(x) + pr_ℓ(x) · ql_ℓ(x)),
+///   pla_ℓ = pl_ℓ + α · ql_ℓ,
+/// ```
+///
+/// producing exactly the messages and transcript interaction of
+/// [`crate::sumcheck::MLSumcheck::prove_as_subprotocol`] run on the MLEs
+/// `[eq, pla_0, ql_0, pr_0, qr_0, …]` with degree 3 (the verifier is
+/// unchanged: it still runs the generic sumcheck verifier).
+///
+/// The eq factor is not carried as a folded multilinear. With
+/// `x = (s_{<i}, X, x')` it splits as
+/// `E_{i-1} · eq(X, r_i) · eq(x', r_{>i})` with `E_{i-1} = Π_{j<i} eq(s_j, r_j)`,
+/// so round `i` needs only the degree-2 inner sum
+/// `H_i(X) = Σ_{x'} eq(x', r_{>i}) · h(s_{<i}, X, x')` at `X ∈ {0, 1, 2}`
+/// (its value at `3` follows by extrapolation), and the round polynomial
+/// is `E_{i-1} · eq(X, r_i) · H_i(X)`. Per hypercube pair and tree that is
+/// three evaluations of `h` instead of four of `eq · h`, one array fewer to
+/// fold each round, and no multiplication by `δ^ℓ` per pair (the per-tree
+/// sums are weighted once).
+///
+/// `per_tree[ℓ] = (pl, pr, ql, qr)`, each `2^k` long. Returns the proof,
+/// the challenges `s` and, per tree, the fully folded
+/// `[pla(s), ql(s), pr(s), qr(s)]`.
+#[allow(clippy::arithmetic_side_effects, clippy::type_complexity)]
+fn layer_sumcheck_prove<F>(
+    transcript: &mut impl Transcript,
+    k: usize,
+    r: &[F],
+    per_tree: &[(&[F], &[F], &[F], &[F])],
+    alpha: &F,
+    delta_powers: &[F],
+    field_cfg: &F::Config,
+) -> (SumcheckProof<F>, Vec<F>, Vec<[F; 4]>)
+where
+    F: InnerTransparentField + FromPrimitiveWithConfig + Send + Sync,
+    F::Inner: ConstTranscribable + Zero + Default + Send + Sync,
+    F::Modulus: ConstTranscribable,
+    F::Config: Sync,
+{
+    debug_assert!(k >= 1, "layer sumcheck needs at least one variable");
+    debug_assert_eq!(r.len(), k);
+    let num_trees = per_tree.len();
+    debug_assert_eq!(delta_powers.len(), num_trees);
+    let one = F::one_with_cfg(field_cfg);
+    let zero = F::zero_with_cfg(field_cfg);
+    let mut buf = vec![0u8; F::Inner::NUM_BYTES];
+
+    // Same preamble as the generic driver.
+    transcript.absorb_random_field(&F::from_with_cfg(k as u64, field_cfg), &mut buf);
+    transcript.absorb_random_field(&F::from_with_cfg(3u64, field_cfg), &mut buf);
+
+    // Round 1 reads the layer slices (`pla` materialised once); the fold
+    // after each round writes the half-size arrays [pla, ql, pr, qr].
+    let mut work: Vec<[Vec<F>; 4]> = cfg_into_iter!(per_tree)
+        .map(|(pl, pr, ql, qr)| {
+            let pla: Vec<F> = pl
+                .iter()
+                .zip(ql.iter())
+                .map(|(pl, ql)| pl.clone() + &(ql.clone() * alpha))
+                .collect();
+            [pla, ql.to_vec(), pr.to_vec(), qr.to_vec()]
+        })
+        .collect();
+
+    let mut messages = Vec::with_capacity(k);
+    let mut s: Vec<F> = Vec::with_capacity(k);
+    // E_{i-1} = Π_{j<i} eq(s_j, r_j).
+    let mut e_prefix = one.clone();
+    let mut claimed_sum = zero.clone();
+
+    for i in 0..k {
+        let r_i = &r[i];
+        // eq(x', r_{>i}) over the remaining variables (`[1]` in the last round).
+        let eq_tail: Vec<F> = if i + 1 < k {
+            build_eq_x_r_vec(&r[i + 1..], field_cfg).expect("eq table build")
+        } else {
+            vec![one.clone()]
+        };
+
+        // H(0), H(1), H(2) = Σ_ℓ δ^ℓ · Σ_b eq_tail[b] · h_{ℓ,b}(X).
+        let mut h = [zero.clone(), zero.clone(), zero.clone()];
+        for (arrays, dp) in work.iter().zip(delta_powers.iter()) {
+            let [pla, ql, pr, qr] = arrays;
+            let sums = layer_round_sums(pla, ql, pr, qr, &eq_tail, &zero);
+            if dp == &one {
+                for (acc, v) in h.iter_mut().zip(sums) {
+                    *acc += &v;
+                }
+            } else {
+                for (acc, v) in h.iter_mut().zip(sums) {
+                    *acc += &(v * dp);
+                }
+            }
+        }
+        let [h0, h1, h2] = h;
+        // Degree 2 in X: H(3) = 3·H(2) − 3·H(1) + H(0).
+        let three_h2 = h2.clone() + &h2 + &h2;
+        let three_h1 = h1.clone() + &h1 + &h1;
+        let h3 = three_h2 - &three_h1 + &h0;
+
+        // eq(X, r_i) = (1 − r_i) + X · (2·r_i − 1).
+        let e0 = one.clone() - r_i;
+        let slope = r_i.clone() + r_i - &one;
+        let e1 = e0.clone() + &slope;
+        let e2 = e1.clone() + &slope;
+        let e3 = e2.clone() + &slope;
+
+        let p0 = e_prefix.clone() * &e0 * &h0;
+        let p1 = e_prefix.clone() * &e1 * &h1;
+        let p2 = e_prefix.clone() * &e2 * &h2;
+        let p3 = e_prefix.clone() * &e3 * &h3;
+        if i == 0 {
+            claimed_sum = p0 + &p1;
+        }
+        let tail = vec![p1, p2, p3];
+        transcript.absorb_random_field_slice(&tail, &mut buf);
+        messages.push(ProverMsg(NatEvaluatedPolyWithoutConstant::new(tail)));
+        let s_i: F = transcript.get_field_challenge(field_cfg);
+        transcript.absorb_random_field(&s_i, &mut buf);
+
+        // Fold the working arrays at s_i and extend the eq prefix.
+        work = cfg_into_iter!(work)
+            .map(|arrays| arrays.map(|a| fold_at(&a, &s_i)))
+            .collect();
+        // eq(s_i, r_i) = 1 − s_i − r_i + 2·s_i·r_i.
+        let sr = s_i.clone() * r_i;
+        e_prefix *= &(one.clone() - &s_i - r_i + &sr + &sr);
+        s.push(s_i);
+    }
+
+    let finals: Vec<[F; 4]> = work
+        .into_iter()
+        .map(|arrays| arrays.map(|a| a.into_iter().next().expect("folded to one entry")))
+        .collect();
+    (
+        SumcheckProof {
+            messages,
+            claimed_sum,
+        },
+        s,
+        finals,
+    )
+}
+
+/// One tree's contribution to a layer round:
+/// `Σ_b eq_tail[b] · h_b(X)` at `X ∈ {0, 1, 2}`, where
+/// `h_b(X) = pla_b(X) · qr_b(X) + pr_b(X) · ql_b(X)` on the pair
+/// `(2b, 2b + 1)` (each array linearly interpolated in `X`).
+#[allow(clippy::arithmetic_side_effects)]
+fn layer_round_sums<F>(
+    pla: &[F],
+    ql: &[F],
+    pr: &[F],
+    qr: &[F],
+    eq_tail: &[F],
+    zero: &F,
+) -> [F; 3]
+where
+    F: InnerTransparentField + Send + Sync,
+{
+    let half = eq_tail.len();
+    debug_assert_eq!(pla.len(), 2 * half);
+    let pair = |b: usize| -> [F; 3] {
+        let (a0, a1) = (&pla[2 * b], &pla[2 * b + 1]);
+        let (c0, c1) = (&ql[2 * b], &ql[2 * b + 1]);
+        let (p0, p1) = (&pr[2 * b], &pr[2 * b + 1]);
+        let (q0, q1) = (&qr[2 * b], &qr[2 * b + 1]);
+        let t0 = a0.clone() * q0 + &(p0.clone() * c0);
+        let t1 = a1.clone() * q1 + &(p1.clone() * c1);
+        // Values at X = 2: 2·v1 − v0.
+        let a2 = a1.clone() + a1 - a0;
+        let c2 = c1.clone() + c1 - c0;
+        let p2 = p1.clone() + p1 - p0;
+        let q2 = q1.clone() + q1 - q0;
+        let t2 = a2 * &q2 + &(p2 * &c2);
+        let w = &eq_tail[b];
+        [t0 * w, t1 * w, t2 * w]
+    };
+    let add3 = |mut acc: [F; 3], v: [F; 3]| -> [F; 3] {
+        for (a, x) in acc.iter_mut().zip(v) {
+            *a += &x;
+        }
+        acc
+    };
+    let init = || [zero.clone(), zero.clone(), zero.clone()];
+    #[cfg(feature = "parallel")]
+    {
+        (0..half)
+            .into_par_iter()
+            .fold(init, |acc, b| add3(acc, pair(b)))
+            .reduce(init, add3)
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        (0..half).fold(init(), |acc, b| add3(acc, pair(b)))
+    }
+}
+
+/// `out[b] = a[2b] + s · (a[2b + 1] − a[2b])`: the multilinear fold of the
+/// first variable at `s` (the pair layout of the sumcheck driver).
+#[allow(clippy::arithmetic_side_effects)]
+fn fold_at<F>(a: &[F], s: &F) -> Vec<F>
+where
+    F: InnerTransparentField + Send + Sync,
+{
+    let half = a.len() / 2;
+    cfg_into_iter!(0..half)
+        .map(|b| {
+            let lo = &a[2 * b];
+            let hi = &a[2 * b + 1];
+            lo.clone() + &((hi.clone() - lo) * s)
+        })
+        .collect()
+}
+
 /// Proves `Σ_{x ∈ {0,1}^d} p(x)/q(x) = root_p/root_q` and returns
 /// a `(GkrFractionProof, eval_point)` pair.  The evaluation point is
 /// tracked during the prove so callers don't need to re-derive it.
@@ -293,7 +515,6 @@ where
     }
 
     let mut layer_proofs = Vec::with_capacity(d);
-    let inner_zero = F::zero_with_cfg(field_cfg).inner().clone();
 
     let mut v_p = root_p.clone();
     let mut v_q = root_q.clone();
@@ -350,80 +571,24 @@ where
             v_q = one_minus_lambda * &ql + &(lambda.clone() * &qr);
             r_k = vec![lambda];
         } else {
-            // Round k ≥ 1: sumcheck over k variables.
-            //
-            // Algebraic re-arrangement (mirrors batched path): precompute
-            // `pla = pl + α·ql` ONCE per layer and feed pla in place of
-            // pl into the sumcheck. Comb_fn drops the per-evaluation
-            // `pl + α·ql`, saving 1 add + 1 mul per hypercube/eval point.
-            // After sumcheck `pl(s) = pla(s) - α·ql(s)` is recovered for
-            // the layer-output absorbed into the transcript.
-            let eq_r = build_eq_x_r_inner(&r_k, field_cfg)
-                .expect("eq polynomial construction should succeed");
-
-            let mk_mle = |data: &[F]| -> DenseMultilinearExtension<F::Inner> {
-                DenseMultilinearExtension::from_evaluations_vec(
-                    k,
-                    data.iter().map(|x| x.inner().clone()).collect(),
-                    inner_zero.clone(),
-                )
-            };
-
-            let alpha_ref = alpha.clone();
-            let pla_vals: Vec<F> = p_left_vals
-                .iter()
-                .zip(q_left_vals.iter())
-                .map(|(pl, ql)| pl.clone() + &(ql.clone() * &alpha_ref))
-                .collect();
-
-            let pla_mle = mk_mle(&pla_vals);
-            let pr_mle = mk_mle(p_right_vals);
-            let ql_mle = mk_mle(q_left_vals);
-            let qr_mle = mk_mle(q_right_vals);
-
-            let mles = vec![eq_r, pla_mle, ql_mle, pr_mle, qr_mle];
-
-            // comb_fn = eq · (pla · qr + pr · ql)
-            let comb_fn = move |vals: &[F]| -> F {
-                let eq_val = &vals[0];
-                let pla_val = &vals[1];
-                let ql_val = &vals[2];
-                let pr_val = &vals[3];
-                let qr_val = &vals[4];
-
-                let inner = pla_val.clone() * qr_val + &(pr_val.clone() * ql_val);
-                eq_val.clone() * &inner
-            };
-
-            let (sumcheck_proof, sumcheck_prover_state) = MLSumcheck::prove_as_subprotocol(
+            // Round k ≥ 1: sumcheck over k variables (see
+            // `layer_sumcheck_prove`; single tree, so δ = [1]).
+            let per_tree = [(p_left_vals, p_right_vals, q_left_vals, q_right_vals)];
+            let one = F::one_with_cfg(field_cfg);
+            let (sumcheck_proof, s, finals) = layer_sumcheck_prove(
                 transcript,
-                mles,
                 k,
-                3,
-                comb_fn,
+                &r_k,
+                &per_tree,
+                &alpha,
+                std::slice::from_ref(&one),
                 field_cfg,
             );
-
-            let s = &sumcheck_prover_state.randomness;
-
-            // Read final MLE evaluations from the sumcheck prover state.
-            // After k rounds, fix_variables was applied k−1 times (the
-            // last challenge is pushed to randomness but not applied),
-            // leaving each MLE with 2 entries.  Interpolate with the
-            // last challenge to get the fully-evaluated scalar.
-            let last_r = s.last().expect("sumcheck should have at least one challenge");
-            let one_minus_last = F::one_with_cfg(field_cfg) - last_r;
-            let interp_mle = |mle: &DenseMultilinearExtension<F::Inner>| -> F {
-                debug_assert_eq!(mle.num_vars, 1, "MLE should have 1 remaining variable");
-                let v0 = F::new_unchecked_with_cfg(mle[0].clone(), field_cfg);
-                let v1 = F::new_unchecked_with_cfg(mle[1].clone(), field_cfg);
-                one_minus_last.clone() * &v0 + &(last_r.clone() * &v1)
-            };
-            // mles[1] holds pla(s) = pl(s) + α·ql(s); recover pl(s).
-            let pla_at_s = interp_mle(&sumcheck_prover_state.mles[1]);
-            let ql_at_s = interp_mle(&sumcheck_prover_state.mles[2]);
-            let pr_at_s = interp_mle(&sumcheck_prover_state.mles[3]);
-            let qr_at_s = interp_mle(&sumcheck_prover_state.mles[4]);
+            let [pla_at_s, ql_at_s, pr_at_s, qr_at_s] = finals
+                .into_iter()
+                .next()
+                .expect("one tree");
+            // pla(s) = pl(s) + α·ql(s); recover pl(s).
             let pl_at_s = pla_at_s - &(ql_at_s.clone() * &alpha);
 
             transcript.absorb_random_field(&pl_at_s, &mut buf);
@@ -444,7 +609,7 @@ where
             let one_minus_lambda = one - &lambda;
             v_p = one_minus_lambda.clone() * &pl_at_s + &(lambda.clone() * &pr_at_s);
             v_q = one_minus_lambda * &ql_at_s + &(lambda.clone() * &qr_at_s);
-            r_k = s.clone();
+            r_k = s;
             r_k.push(lambda);
         }
     }
@@ -664,7 +829,6 @@ where
     }
 
     let mut layer_proofs = Vec::with_capacity(d);
-    let inner_zero = F::zero_with_cfg(field_cfg).inner().clone();
 
     // Per-tree running values.
     let mut v_ps: Vec<F> = roots_p.clone();
@@ -762,133 +926,30 @@ where
             r_k = vec![lambda];
         } else {
             // Round k ≥ 1: batched sumcheck over k variables.
-            // The combined claim = Σ_ℓ δ^ℓ · (v_p[ℓ] + α · v_q[ℓ])
-            //
-            // Algebraic re-arrangement: we precompute `pla = pl + α·ql`
-            // ONCE per layer and feed pla (instead of pl) into the
-            // sumcheck. The comb_fn then drops the per-evaluation
-            // `pl + α·ql` computation:
-            //   f(eq, pla_0, ql_0, pr_0, qr_0, ..., pla_{L-1}, ql_{L-1}, pr_{L-1}, qr_{L-1})
-            //     = eq · Σ_ℓ δ^ℓ · (pla_ℓ · qr_ℓ + pr_ℓ · ql_ℓ)
-            // Saves 1 add + 1 mul per (ell, hypercube point, eval point) ≈
-            // 25 % of comb_fn flops at L = 16. After sumcheck the prover
-            // recovers `pl(s) = pla(s) - α · ql(s)` for the layer-output
-            // (pl, ql, pr, qr) absorbed into the transcript.
-
-            let eq_r = build_eq_x_r_inner(&r_k, field_cfg)
-                .expect("eq polynomial construction should succeed");
-
-            let mk_mle = |data: &[F]| -> DenseMultilinearExtension<F::Inner> {
-                DenseMultilinearExtension::from_evaluations_vec(
-                    k,
-                    data.iter().map(|x| x.inner().clone()).collect(),
-                    inner_zero.clone(),
-                )
-            };
-
-            // Build MLEs: [eq, pla_0, ql_0, pr_0, qr_0, ..., pla_{L-1}, ql_{L-1}, pr_{L-1}, qr_{L-1}]
-            //
-            // The pla precomputation (`pl + α·ql` per leaf) is per-tree
-            // and embarrassingly parallel across L trees.
-            let alpha_ref = alpha.clone();
-            let pla_per_tree: Vec<Vec<F>> = cfg_into_iter!(0..num_trees)
-                .map(|ell| {
-                    let (pl_vals, _pr_vals, ql_vals, _qr_vals) = per_tree[ell];
-                    pl_vals
-                        .iter()
-                        .zip(ql_vals.iter())
-                        .map(|(pl, ql)| pl.clone() + &(ql.clone() * &alpha_ref))
-                        .collect()
-                })
-                .collect();
-
-            // Build the 4·L body MLEs in parallel over trees — each is an
-            // independent O(2^k) clone+convert, and this per-layer build was
-            // the dominant serial block on the witness-GKR path. The
-            // [eq, then per-ell pla/ql/pr/qr] ordering is preserved so the
-            // sumcheck's MLE indexing (and thus the FS transcript) is
-            // byte-identical.
-            let bodies: Vec<[DenseMultilinearExtension<F::Inner>; 4]> =
-                cfg_into_iter!(0..num_trees)
-                    .map(|ell| {
-                        let (_pl_vals, pr_vals, ql_vals, qr_vals) = per_tree[ell];
-                        [
-                            mk_mle(&pla_per_tree[ell]),
-                            mk_mle(ql_vals),
-                            mk_mle(pr_vals),
-                            mk_mle(qr_vals),
-                        ]
-                    })
-                    .collect();
-            let mut mles = Vec::with_capacity(1 + 4 * num_trees);
-            mles.push(eq_r);
-            for [pla, ql, pr, qr] in bodies {
-                mles.push(pla);
-                mles.push(ql);
-                mles.push(pr);
-                mles.push(qr);
-            }
-
-            // Capture δ-powers by move; α is folded into pla and is no
-            // longer referenced in the comb_fn (one fewer mul + add per
-            // (ell, eval-point)).
-            let delta_powers_ref = delta_powers.clone();
-            let nt = num_trees;
-            let zero_template = F::zero_with_cfg(field_cfg);
-            let comb_fn = move |vals: &[F]| -> F {
-                let eq_val = &vals[0];
-                let mut acc = zero_template.clone();
-                for ell in 0..nt {
-                    let base = 1 + 4 * ell;
-                    let pla_val = &vals[base];
-                    let ql_val = &vals[base + 1];
-                    let pr_val = &vals[base + 2];
-                    let qr_val = &vals[base + 3];
-                    // pla · qr + pr · ql, weighted by δ^ell.
-                    let inner = pla_val.clone() * qr_val + &(pr_val.clone() * ql_val);
-                    acc += &(inner * &delta_powers_ref[ell]);
-                }
-                eq_val.clone() * &acc
-            };
-
-            let (sumcheck_proof, sumcheck_prover_state) =
-                MLSumcheck::prove_as_subprotocol(
-                    transcript,
-                    mles,
-                    k,
-                    3,
-                    comb_fn,
-                    field_cfg,
-                );
-
-            let s = &sumcheck_prover_state.randomness;
-            let last_r = s.last().expect("sumcheck should have ≥1 challenge");
-            let one_minus_last = F::one_with_cfg(field_cfg) - last_r;
-
-            let interp_mle =
-                |mle: &DenseMultilinearExtension<F::Inner>| -> F {
-                    debug_assert_eq!(mle.num_vars, 1);
-                    let v0 = F::new_unchecked_with_cfg(mle[0].clone(), field_cfg);
-                    let v1 = F::new_unchecked_with_cfg(mle[1].clone(), field_cfg);
-                    one_minus_last.clone() * &v0 + &(last_r.clone() * &v1)
-                };
+            // The combined claim = Σ_ℓ δ^ℓ · (v_p[ℓ] + α · v_q[ℓ]); the
+            // sumcheck polynomial is
+            //   eq(x, r) · Σ_ℓ δ^ℓ · ((pl_ℓ + α·ql_ℓ) · qr_ℓ + pr_ℓ · ql_ℓ)
+            // (see `layer_sumcheck_prove` for the eq-factored prover).
+            let (sumcheck_proof, s, finals) = layer_sumcheck_prove(
+                transcript,
+                k,
+                &r_k,
+                &per_tree,
+                &alpha,
+                &delta_powers,
+                field_cfg,
+            );
 
             let mut p_lefts = Vec::with_capacity(num_trees);
             let mut p_rights = Vec::with_capacity(num_trees);
             let mut q_lefts = Vec::with_capacity(num_trees);
             let mut q_rights = Vec::with_capacity(num_trees);
 
-            for ell in 0..num_trees {
-                let base = 1 + 4 * ell;
-                // Index `base` holds pla(s) = pl(s) + α·ql(s); recover
-                // pl(s) = pla(s) - α·ql(s) since the (pl, pr, ql, qr)
-                // absorbed are the per-tree layer-transition evals (pla
-                // is an internal sumcheck artifact, never sent in the
-                // proof and never absorbed).
-                let pla = interp_mle(&sumcheck_prover_state.mles[base]);
-                let ql = interp_mle(&sumcheck_prover_state.mles[base + 1]);
-                let pr = interp_mle(&sumcheck_prover_state.mles[base + 2]);
-                let qr = interp_mle(&sumcheck_prover_state.mles[base + 3]);
+            for [pla, ql, pr, qr] in finals {
+                // pla(s) = pl(s) + α·ql(s); recover pl(s) = pla(s) − α·ql(s)
+                // since the (pl, pr, ql, qr) absorbed are the per-tree
+                // layer-transition evals (pla is an internal sumcheck
+                // artifact, never sent in the proof and never absorbed).
                 let pl = pla - &(ql.clone() * &alpha);
 
                 transcript.absorb_random_field(&pl, &mut buf);
@@ -924,7 +985,7 @@ where
                         + &(lambda.clone() * &q_rights[ell])
                 })
                 .collect();
-            r_k = s.clone();
+            r_k = s;
             r_k.push(lambda);
         }
     }
