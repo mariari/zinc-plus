@@ -722,12 +722,32 @@ where
     let table_len = table.len();
 
     // ---- Step 3: one multiplicity histogram over the whole group ----
-    let mut counts = vec![0u64; table_len];
-    for col in &idx {
-        for &n in col {
-            counts[n as usize] += 1;
+    // (per-thread partial histograms over columns, summed.)
+    let counts: Vec<u64> = {
+        let fold_col = |mut hist: Vec<u64>, col: &Vec<u32>| {
+            for &n in col {
+                hist[n as usize] += 1;
+            }
+            hist
+        };
+        let sum = |mut a: Vec<u64>, b: Vec<u64>| {
+            for (x, y) in a.iter_mut().zip(b) {
+                *x += y;
+            }
+            a
+        };
+        #[cfg(feature = "parallel")]
+        {
+            idx.par_iter()
+                .fold(|| vec![0u64; table_len], fold_col)
+                .reduce(|| vec![0u64; table_len], sum)
         }
-    }
+        #[cfg(not(feature = "parallel"))]
+        {
+            let _ = sum;
+            idx.iter().fold(vec![0u64; table_len], fold_col)
+        }
+    };
     let agg_mults: Vec<Vec<F>> =
         vec![counts.into_iter().map(|c| F::from_with_cfg(c, field_cfg)).collect()];
 
@@ -744,11 +764,16 @@ where
     let w_size = 1usize << w_num_vars;
     let beta_minus_table: Vec<F> = table.iter().map(|t| beta.clone() - t).collect();
     let mut leaf_q: Vec<F> = Vec::with_capacity(w_size);
-    for col in &idx {
-        for &n in col {
-            leaf_q.push(beta_minus_table[n as usize].clone());
-        }
-    }
+    #[cfg(feature = "parallel")]
+    leaf_q.par_extend(
+        idx.par_iter()
+            .flat_map_iter(|col| col.iter().map(|&n| beta_minus_table[n as usize].clone())),
+    );
+    #[cfg(not(feature = "parallel"))]
+    leaf_q.extend(
+        idx.iter()
+            .flat_map(|col| col.iter().map(|&n| beta_minus_table[n as usize].clone())),
+    );
     let witness_tree = if leaves == w_size {
         build_fraction_tree_ones_leaf(one.clone(), leaf_q)
     } else {
