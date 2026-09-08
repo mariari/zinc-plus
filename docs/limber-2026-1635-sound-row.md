@@ -302,3 +302,27 @@ per cell), the GKR layer sumchecks 0.8 s, the CPR constraint closure
   (`blake3_hash_many_neon` ≈ 0.18 s) plus the per-leaf hasher overhead,
   so the next lever here is a narrower codeword serialization, not the
   gather.
+
+- **Compact multiplicity serialization**
+  (`piop/src/lookup/gkr_logup/structs.rs`). The `2^16`-entry
+  multiplicity vector was written as field elements (16 B each, 1 MiB);
+  it is now written as little-endian counts with a per-vector byte width
+  (1/2/4/8, chosen from the maximum count — 1 byte here, 64 KiB). The
+  writer recovers each count from its field element (Montgomery form ×
+  raw inner `1`) and asserts the round trip; the reader rebuilds
+  `F::from(count)` (memoised) so prover and verifier absorb exactly the
+  same field elements as before — the argument, the transcript and the
+  verifier logic are untouched, only the bytes on the wire. Raw proof
+  2 386 301 → 1 403 262 bytes; zstd ≈ −35 KiB (the counts were already
+  compressible).
+
+- **`CombR = Int<4>` for the limb lane** (bench-only, worst-case bound
+  in the bench comment: combined-row entries `< 2^153`, their
+  `encode_wide` `< 2^226`, the opened columns' alpha-combination
+  `< 2^226`, all below 255 signed bits; CHECKED-validated at nvars = 13).
+  The combined row is 8192 × 32 B instead of × 48 B: raw proof
+  1 403 262 → 1 272 190 bytes and, since the alpha-weighted row is
+  incompressible, ≈ −130 KiB zstd as well; the verifier's `encode_wide`
+  and the prover's combined-row accumulation run on 4 limbs (verify
+  22.6 → 19.8 ms, step 7 0.105 → 0.061 s, LTO off). Together with the
+  compact multiplicities: **raw 2.33 MB → 1.27 MB, zstd 881 → 845 KiB**.

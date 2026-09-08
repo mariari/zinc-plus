@@ -24,7 +24,9 @@ pub mod verifier;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-use crypto_primitives::{ConstIntRing, ConstIntSemiring, FromWithConfig, PrimeField, Semiring};
+use crypto_primitives::{
+    ConstIntRing, ConstIntSemiring, FromPrimitiveWithConfig, FromWithConfig, PrimeField, Semiring,
+};
 use std::{fmt::Debug, marker::PhantomData};
 use thiserror::Error;
 use zinc_piop::{
@@ -48,7 +50,10 @@ use zinc_poly::{
 use zinc_primality::PrimalityTest;
 use zinc_transcript::traits::{ConstTranscribable, GenTranscribable, Transcribable, Transcript};
 use zinc_uair::{Uair, ideal::Ideal};
-use zinc_utils::{cfg_extend, cfg_into_iter, cfg_iter, mul, named::Named};
+use zinc_utils::{
+    cfg_extend, cfg_into_iter, cfg_iter, inner_transparent_field::InnerTransparentField, mul,
+    named::Named,
+};
 use zip_plus::{
     ZipError,
     code::LinearCode,
@@ -116,7 +121,7 @@ pub struct Proof<F: PrimeField> {
 
 impl<F> GenTranscribable for Proof<F>
 where
-    F: PrimeField,
+    F: InnerTransparentField + FromPrimitiveWithConfig,
     F::Inner: ConstTranscribable,
     F::Modulus: ConstTranscribable,
 {
@@ -274,7 +279,7 @@ where
 
 impl<F> Transcribable for Proof<F>
 where
-    F: PrimeField,
+    F: InnerTransparentField + FromPrimitiveWithConfig,
     F::Inner: ConstTranscribable,
     F::Modulus: ConstTranscribable,
 {
