@@ -338,3 +338,23 @@ per cell), the GKR layer sumchecks 0.8 s, the CPR constraint closure
   the operation count suggests (the base-layer gather and the widening
   pass are memory-bound), so the encoder's remaining cost is the
   `i128` stages and the base-layer gather.
+
+- **`N` as one scalar in the limb UAIR** (bench-only). The constraint
+  recombined `u·N` by Horner over the 128 sixteen-bit limbs of `N`, each
+  a fresh `DensePolynomial` temporary, so every use missed the
+  per-call pointer cache of projected scalars and paid a hash lookup
+  (≈ 5M per prove in the CPR alone). `N` is now a single 2048-bit scalar
+  (`Scalar = DensePolynomial<Int<34>, 1>`): the constraint uses two
+  distinct scalars (the radix and `N`), both cached, and `u·N` is one
+  scalar multiplication. Same statement, same range checks. CPR
+  0.404 → 0.342 s, ideal check 0.198 → 0.178 s (LTO off).
+
+- **Scalar ideal-check rows for int-only traces**
+  (`piop/src/ideal_check/combined_poly_builder.rs`). When the UAIR has
+  no binary / arbitrary-poly columns, no bit-op virtual columns and only
+  degree-0 projected scalars, the combined-polynomial builder evaluates
+  each row's constraints over `F` (a `ScalarRowBuilder` with `Expr = F`)
+  instead of over `F_q[X]` with a heap-allocated polynomial per
+  operation, and wraps the results as the same degree-0 polynomials.
+  Ideal check 0.178 → 0.057 s (LTO off); the absorbed values and the
+  proof are unchanged. Together: **prove 2.349 → 2.139 s (LTO off)**.

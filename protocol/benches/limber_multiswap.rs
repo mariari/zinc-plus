@@ -749,13 +749,6 @@ type RsaLimbZincTypes = GenericBenchZincTypes<
     /* int code    = */ NarrowIprs,
 >;
 
-/// The 128 little-endian 16-bit limbs of N = 2^2048 − 59.
-fn modulus_limbs16() -> [i64; LIMBS_PER_VALUE] {
-    let n = modulus_raw();
-    let words = n.as_words();
-    core::array::from_fn(|i| ((words[i / 4] >> (16 * (i % 4))) & 0xFFFF) as i64)
-}
-
 fn limb_int(v: u64) -> LimbInt {
     i64::try_from(v).expect("16-bit limb fits an i64")
 }
@@ -772,8 +765,11 @@ pub struct RsaModMulLimbUair;
 
 impl Uair for RsaModMulLimbUair {
     type Ideal = ImpossibleIdeal;
-    /// Degree-0 scalars: the radix 2^16 and the limbs of N.
-    type Scalar = DensePolynomial<i64, 1>;
+    /// Degree-0 scalars: the radix 2^16 and N itself (one 2048-bit
+    /// scalar, so `u·N` is a single scalar multiplication and the
+    /// constraint uses two distinct scalars in total — both hit the
+    /// per-call projection cache instead of a hash lookup per use).
+    type Scalar = DensePolynomial<RsaInt, 1>;
 
     fn signature() -> UairSignature {
         let total = TotalColumnLayout::new(0, 0, LIMB_COLS);
@@ -799,7 +795,7 @@ impl Uair for RsaModMulLimbUair {
         MulByScalar: Fn(&B::Expr, &Self::Scalar) -> Option<B::Expr>,
         IFromR: Fn(&Self::Ideal) -> B::Ideal,
     {
-        let radix = DensePolynomial::<i64, 1>::new([1i64 << LIMB_BITS]);
+        let radix = DensePolynomial::<RsaInt, 1>::new([RsaInt::from(1i64 << LIMB_BITS)]);
         // value = Σ_i 2^{16 i} · limb_i, Horner from the top limb down.
         let value = |base: usize| -> B::Expr {
             let mut acc = up.int[base + LIMBS_PER_VALUE - 1].clone();
@@ -813,13 +809,9 @@ impl Uair for RsaModMulLimbUair {
         let c = value(2 * LIMBS_PER_VALUE);
         let u = value(3 * LIMBS_PER_VALUE);
 
-        // u·N = Σ_i n_i · 2^{16 i} · u, Horner over the limbs n_i of N.
-        let n_limbs = modulus_limbs16();
-        let n_scalar = |i: usize| DensePolynomial::<i64, 1>::new([n_limbs[i]]);
-        let mut un = mbs(&u, &n_scalar(LIMBS_PER_VALUE - 1)).expect("n mul");
-        for i in (0..LIMBS_PER_VALUE - 1).rev() {
-            un = mbs(&un, &radix).expect("radix mul") + &mbs(&u, &n_scalar(i)).expect("n mul");
-        }
+        // u·N with N as one scalar.
+        let n = DensePolynomial::<RsaInt, 1>::new([int34(&modulus_raw().resize::<64>())]);
+        let un = mbs(&u, &n).expect("n mul");
 
         b.assert_zero(a * &bb - &c - &un);
     }
