@@ -358,3 +358,20 @@ per cell), the GKR layer sumchecks 0.8 s, the CPR constraint closure
   operation, and wraps the results as the same degree-0 polynomials.
   Ideal check 0.178 → 0.057 s (LTO off); the absorbed values and the
   proof are unchanged. Together: **prove 2.349 → 2.139 s (LTO off)**.
+
+- **Multi-threading actually reaches Zip+** (`protocol/Cargo.toml`). The
+  protocol crate's `parallel` feature forwarded to piop / poly / uair /
+  utils but not to `zip-plus/parallel`, so under `--features parallel`
+  the whole commit (IPRS encode, Merkle) and the openings ran
+  single-threaded — the reason the sound row scaled only 2.4× on 10
+  cores (commit 1.03 s in a 1.42 s multi-threaded prove). With the
+  feature forwarded: commit 1.035 → 0.206 s, **multi-threaded prove
+  1.419 → 0.560 s (LTO off)**. The pre-existing zip-plus test
+  `encoding_is_consistent_across_threads` (gated on zip-plus's
+  `parallel`) was failing on its own: its matrix geometry used a 32-entry
+  row length against a 256-entry code, leaving 28 of 32 codeword rows
+  uninitialized; it now uses `ZipPlus::setup`. Two smaller serial
+  sections were removed on the way: the CPR closure rebuilt the UAIR
+  signature (a 512-entry lookup-spec vector) on every evaluation — now
+  captured once — and the int lookup prover's multiplicity histogram and
+  leaf-denominator construction (4.2M cells each) are parallel.
