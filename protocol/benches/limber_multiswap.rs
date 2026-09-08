@@ -648,7 +648,14 @@ impl GenerateRandomTrace<DEGREE_PLUS_ONE> for RsaModMulWide16Uair {
 const LIMB_BITS: u32 = 16;
 const LIMBS_PER_VALUE: usize = 2048 / LIMB_BITS as usize; // 128
 const LIMB_COLS: usize = 4 * LIMBS_PER_VALUE; // a | b | c | u
-const LIMB_M: usize = 6; // combination ring: Cw + 128-bit alphas/coeffs + row sums
+/// Combination-ring limbs. Worst-case bound: a combined-row entry is
+/// `Σ_j alpha_j · v_j` over 512 columns with 128-bit alphas and 16-bit
+/// limbs, `< 2^(128+16+9) = 2^153`; the verifier's `encode_wide` of it
+/// grows by the encoder's factor (`16 · 2^15` in the base layer, then
+/// `< 2^18` per radix-8 stage, three stages: `< 2^73`), and the opened
+/// columns' alpha-combination is `512 · 2^128 · 2^89 = 2^226`. Both stay
+/// below the 255 signed bits of `Int<4>` (CHECKED-validated at nvars = 13).
+const LIMB_M: usize = 4;
 
 /// One native 64-bit cell per 16-bit limb (sign headroom included) and
 /// native 128-bit codeword entries: the encoder grows 16-bit limbs by
