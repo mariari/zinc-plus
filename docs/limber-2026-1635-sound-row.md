@@ -1,7 +1,7 @@
 # Limber's Zinc+ row, made sound: range checks, random prime, security target
 
 **Date:** 2026-09-08 · **Branch:** `main-beta` (integration branch
-`main-beta-limber-updates`, commits `693acee..`) · **Machine:** MacBook,
+`main-beta-limber-updates`, commits `577c0ae..`) · **Machine:** MacBook,
 Apple M4 (10 cores, 16 GB), same box and methodology as the two earlier
 notes (`docs/limber-2026-1635-reproduction.md`, 2026-08-21, and
 `docs/limber-2026-1635-folded-main-beta.md`, 2026-08-26): single-threaded,
@@ -424,7 +424,7 @@ per cell), the GKR layer sumchecks 0.8 s, the CPR constraint closure
   table has a closed form (`β − Σ_i 2^i r_i` for a full power-of-two
   table) that would remove 2^16 field multiplications; not done.
 
-### Results after this pass (commits `de19d57..789e152`)
+### Results after this pass (commits `2a5eae7..2cbdb81`)
 
 Same machine and methodology as §4 (Apple M4, `simd unchecked
 iprs-rate-1-8`, LTO, `-C target-cpu=native`, medians of 3; MT = the
