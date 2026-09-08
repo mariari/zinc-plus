@@ -67,14 +67,13 @@ const REP: usize = if cfg!(feature = "iprs-rate-1-16") {
     4
 };
 
-/// Openings tied to REP (repo convention: 150 @ 1/4, 100 @ 1/8, 75 @ 1/16).
-const NUM_COL_OPENINGS_FOR_REP: usize = if cfg!(feature = "iprs-rate-1-16") {
-    75
-} else if cfg!(feature = "iprs-rate-1-8") {
-    100
-} else {
-    150
-};
+/// Target security level (100 by default; `sec-114` / `sec-128` features).
+const SECURITY_BITS: usize = zinc_protocol::SECURITY_BITS;
+
+/// Openings for `SECURITY_BITS` at rate `1/REP` (150 / 100 / 75 at 100 bits
+/// for rates 1/4, 1/8, 1/16; see `zip_plus::pcs::structs::num_column_openings`).
+const NUM_COL_OPENINGS_FOR_REP: usize =
+    zip_plus::pcs::structs::num_column_openings(REP, SECURITY_BITS);
 
 //
 // Generic Zip/Zinc type scaffolding — copied from `protocol/benches/e2e.rs`

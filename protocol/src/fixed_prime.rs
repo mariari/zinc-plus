@@ -1,21 +1,26 @@
-//! Compile-time projecting prime for the `fixed-prime` branch.
+//! Fixed projecting primes.
 //!
 //! In Zinc+, the projecting prime `q` for the
-//! `\phi_q : Z[X] -> F_q[X]` step (Step 1 of the protocol) is normally
-//! drawn from the Fiat–Shamir transcript. On this branch we replace
-//! that with the **secp256k1 base field prime**
+//! `\phi_q : Z[X] -> F_q[X]` step (Step 1 of the protocol) is drawn from
+//! the Fiat–Shamir transcript — that is the sound, general behaviour and
+//! the default (`ZincTypes::FIXED_PROJECTING_PRIME = None`). A type bundle
+//! may instead pin a fixed prime by setting `FIXED_PROJECTING_PRIME =
+//! Some(bytes)`; the SHA+ECDSA demo pins the **secp256k1 base field prime**
 //! `p = 2^256 − 2^32 − 977`
-//!   `= 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F`.
+//!   `= 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F`
+//! because its EC constraints are secp256k1-specific algebraic identities
+//! that only hold modulo that prime.
 //!
 //! Soundness: a fixed projecting prime is in general NOT sound — a
 //! constraint-grinding adversary can craft witnesses whose ideal-check
 //! residues vanish mod a known `q`. For the targeted SHA+ECDSA proving
 //! application this does not break soundness (the relevant constraints
-//! are honest mod `p`). Do not reuse this branch for other applications
-//! without re-doing the soundness analysis.
+//! are honest mod `p`). Do not pin a prime for other applications without
+//! re-doing the soundness analysis.
 
-use crypto_primitives::PrimeField;
-use zinc_transcript::traits::ConstTranscribable;
+use crypto_primitives::{ConstIntSemiring, PrimeField};
+use zinc_primality::PrimalityTest;
+use zinc_transcript::traits::{ConstTranscribable, Transcript};
 use zinc_utils::from_ref::FromRef;
 
 /// secp256k1 base field prime, little-endian byte order (32 bytes).
@@ -30,11 +35,30 @@ pub const SECP256K1_P_LE_BYTES: [u8; 32] = [
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 ];
 
-/// Build `F::Config` from the secp256k1 base prime, replacing the
-/// previous `Transcript::get_random_field_cfg` draw.
+/// Build `F::Config` from a fixed prime given as little-endian
+/// transcription bytes (the `FMod` encoding), installing it as the
+/// projecting field modulus.
 ///
-/// Trait bounds match the existing call-site bounds, so no changes to
-/// the surrounding generic signatures are required.
+/// Panics if `bytes.len()` differs from `FMod::NUM_BYTES` — a pinned
+/// prime must match the instantiated `Fmod` width exactly.
+pub fn fixed_field_cfg_from_bytes<F, FMod>(bytes: &[u8]) -> F::Config
+where
+    F: PrimeField,
+    FMod: ConstTranscribable,
+    F::Modulus: FromRef<FMod>,
+{
+    assert_eq!(
+        FMod::NUM_BYTES,
+        bytes.len(),
+        "FIXED_PROJECTING_PRIME has {} bytes but Fmod is {} bytes wide",
+        bytes.len(),
+        FMod::NUM_BYTES,
+    );
+    let prime = FMod::read_transcription_bytes_exact(bytes);
+    F::make_cfg(&F::Modulus::from_ref(&prime)).expect("the fixed projecting modulus is prime")
+}
+
+/// Build `F::Config` from the secp256k1 base prime.
 ///
 /// Panics if `FMod` cannot hold a 256-bit value (its `NUM_BYTES` differs
 /// from `SECP256K1_P_LE_BYTES.len()`).
@@ -44,14 +68,29 @@ where
     FMod: ConstTranscribable,
     F::Modulus: FromRef<FMod>,
 {
-    assert_eq!(
-        FMod::NUM_BYTES,
-        SECP256K1_P_LE_BYTES.len(),
-        "Fmod must be exactly 256 bits to hold the secp256k1 base prime",
-    );
-    let prime = FMod::read_transcription_bytes_exact(&SECP256K1_P_LE_BYTES);
-    F::make_cfg(&F::Modulus::from_ref(&prime))
-        .expect("secp256k1 base field prime is prime")
+    fixed_field_cfg_from_bytes::<F, FMod>(&SECP256K1_P_LE_BYTES)
+}
+
+/// Step-1 projecting-field selection shared by every prover/verifier
+/// path: a pinned prime when `fixed` is `Some`, otherwise a fresh prime
+/// drawn from the Fiat–Shamir transcript (whose state at this point
+/// already covers the witness commitments and the public columns, so the
+/// prime is a function of the committed witness, as soundness requires).
+pub fn projecting_field_cfg<F, FMod, PrimeTest, T>(
+    fixed: Option<&[u8]>,
+    transcript: &mut T,
+) -> F::Config
+where
+    F: PrimeField,
+    FMod: ConstTranscribable + ConstIntSemiring,
+    F::Modulus: FromRef<FMod>,
+    PrimeTest: PrimalityTest<FMod>,
+    T: Transcript,
+{
+    match fixed {
+        Some(bytes) => fixed_field_cfg_from_bytes::<F, FMod>(bytes),
+        None => transcript.get_random_field_cfg::<F, FMod, PrimeTest>(),
+    }
 }
 
 #[cfg(test)]

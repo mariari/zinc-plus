@@ -37,11 +37,6 @@ impl Blake3Transcript {
         self.hasher.finalize_xof().fill(buf);
     }
 
-    fn gen_random<R: ConstTranscribable>(&mut self, buf: &mut [u8]) -> R {
-        self.fill_with_random_bytes(buf);
-        self.absorb_inner(buf);
-        R::read_transcription_bytes_exact(buf)
-    }
 }
 
 impl Transcript for Blake3Transcript {
@@ -54,17 +49,27 @@ impl Transcript for Blake3Transcript {
         T::read_transcription_bytes_exact(&buf)
     }
 
+    /// Draws a prime of exactly `8 · R::NUM_BYTES` bits from the transcript:
+    /// candidates are uniform random `R` values with the most-significant
+    /// bit forced to 1 (so the prime has the full bit length and the
+    /// soundness accounting can use `2^(bits-1)` as a lower bound) and the
+    /// least-significant bit forced to 1, tested with `T` until one passes.
+    /// The random bytes are absorbed as they are drawn, so prover and
+    /// verifier stay in lockstep regardless of how many candidates fail.
     #[allow(clippy::arithmetic_side_effects)]
     fn get_prime<R: ConstIntSemiring + ConstTranscribable, T: PrimalityTest<R>>(&mut self) -> R {
         let buf = &mut vec![0u8; R::NUM_BYTES];
         loop {
-            let mut prime_candidate: R = self.gen_random(buf);
-            if prime_candidate.is_zero() {
-                continue;
+            self.fill_with_random_bytes(buf);
+            // `R` is transcribed as little-endian limbs, so the last byte
+            // holds the most-significant bits and the first byte the
+            // least-significant ones.
+            if let Some(last) = buf.last_mut() {
+                *last |= 0x80;
             }
-            if prime_candidate.is_even() {
-                prime_candidate -= R::ONE;
-            }
+            buf[0] |= 0x01;
+            self.absorb_inner(buf);
+            let prime_candidate: R = R::read_transcription_bytes_exact(buf);
             if T::is_probably_prime(&prime_candidate) {
                 return prime_candidate;
             }

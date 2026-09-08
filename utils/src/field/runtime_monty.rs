@@ -30,11 +30,11 @@
 //! transcript-drawn prime cannot be.
 //!
 //! [`Fp`] threads the needle: the modulus is a runtime value, but it is stored
-//! **once** in a process-global [`OnceLock`] selected by a zero-sized *slot*
+//! **once** in a process-global atomic cell selected by a zero-sized *slot*
 //! type `S` (see [`Modulus`] / [`define_modulus!`]). The element itself is just
 //! the Montgomery-form `Uint<LIMBS>` — identical footprint to `ConstMontyForm`.
-//! Arithmetic reads the shared params through the slot (a lock-free atomic load
-//! after one-time install), so no element ever carries the config.
+//! Arithmetic reads the shared params through the slot (one lock-free atomic
+//! load per operation), so no element ever carries the config.
 //!
 //! The slot caches the Montgomery `mod_neg_inv` alongside the params, so the hot
 //! multiply (a faithful CIOS port — see [`mont_mul`]) reads only references and
@@ -47,10 +47,17 @@
 //!
 //! # Constraints / tradeoffs
 //!
-//! * **One modulus per slot per process.** A slot is set once; re-installing the
-//!   *same* modulus is a no-op, re-installing a *different* one panics. The
-//!   `main-beta` prover uses a single fixed prime, so one slot suffices. Code
-//!   that must juggle several moduli in one process declares several slots.
+//! * **One live modulus per slot at a time.** A slot holds a single modulus;
+//!   re-installing the *same* modulus is a no-op, and installing a *different*
+//!   one atomically replaces it (the previous [`Params`] block is leaked — a
+//!   few hundred bytes per install, i.e. per proof). Replacing the modulus
+//!   invalidates every `Fp` element of the old modulus that is still alive
+//!   (they would be silently reinterpreted), so callers must only re-install
+//!   between proofs — never while elements of the old modulus are in use, and
+//!   never concurrently from two proofs sharing one slot. This is what lets the
+//!   prover draw a fresh Fiat–Shamir prime per proof (`ZincTypes::
+//!   FIXED_PROJECTING_PRIME = None`) while keeping value-sized elements. Code
+//!   that must juggle several moduli *simultaneously* declares several slots.
 //! * The modulus must be installed (via [`Modulus::install`] /
 //!   [`Modulus::install_modulus`]) before any arithmetic; otherwise the ambient
 //!   lookup panics with a clear message.
@@ -67,7 +74,7 @@
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crypto_bigint::modular::{MontyForm, MontyParams};
 use crypto_bigint::{NonZero, Odd, Uint, Word};
@@ -101,31 +108,52 @@ impl<const LIMBS: usize> Params<LIMBS> {
 
 /// A compile-time tag selecting a single runtime-installed modulus.
 ///
-/// Each implementing (zero-sized) type owns exactly one `OnceLock<Params>` via
-/// [`Modulus::cell`]. Use [`define_modulus!`] to declare one.
+/// Each implementing (zero-sized) type owns exactly one atomic cell (an
+/// `AtomicPtr<Params>`, null until the first install) via [`Modulus::cell`].
+/// Use [`define_modulus!`] to declare one.
 pub trait Modulus<const LIMBS: usize>:
     Copy + Clone + PartialEq + Eq + fmt::Debug + Send + Sync + 'static
 {
-    /// The process-global cell holding this slot's parameters.
-    fn cell() -> &'static OnceLock<Params<LIMBS>>;
+    /// The process-global cell holding a pointer to this slot's parameters
+    /// (null while nothing is installed).
+    fn cell() -> &'static AtomicPtr<Params<LIMBS>>;
 
     /// The installed parameters. Panics if the modulus was never installed.
     #[inline(always)]
     fn params() -> &'static Params<LIMBS> {
-        Self::cell()
-            .get()
-            .expect("runtime_monty: modulus not installed for this slot; call install() first")
+        let ptr = Self::cell().load(Ordering::Acquire);
+        assert!(
+            !ptr.is_null(),
+            "runtime_monty: modulus not installed for this slot; call install() first"
+        );
+        // SAFETY: a non-null pointer stored in the cell always comes from
+        // `Box::leak` in `install`, so it points to a `'static` `Params` that
+        // is never freed.
+        unsafe { &*ptr }
     }
 
-    /// Install ready-made [`Params`]. Idempotent for the *same* modulus; panics
-    /// if a *different* modulus was already installed in this slot.
+    /// The installed parameters, or `None` if nothing was installed yet.
+    #[inline]
+    fn try_params() -> Option<&'static Params<LIMBS>> {
+        let ptr = Self::cell().load(Ordering::Acquire);
+        // SAFETY: see `params`.
+        (!ptr.is_null()).then(|| unsafe { &*ptr })
+    }
+
+    /// Install ready-made [`Params`]. A no-op when the *same* modulus is
+    /// already installed; otherwise atomically replaces the slot's modulus.
+    ///
+    /// Replacing invalidates every live `Fp` element of the previous modulus
+    /// (see the module docs) — only call between proofs.
     fn install(params: Params<LIMBS>) {
-        if let Err(_already_set) = Self::cell().set(params) {
-            assert!(
-                Self::params() == &params,
-                "runtime_monty: slot already installed with a different modulus"
-            );
+        if Self::try_params() == Some(&params) {
+            return;
         }
+        let leaked: *mut Params<LIMBS> = Box::leak(Box::new(params));
+        // The previous block (if any) is intentionally leaked: outstanding
+        // `&'static Params` references handed out by `params()` must stay
+        // valid.
+        Self::cell().store(leaked, Ordering::Release);
     }
 
     /// Install from crypto-bigint [`MontyParams`] (e.g. an existing `F::Config`).
@@ -145,9 +173,9 @@ pub trait Modulus<const LIMBS: usize>:
 /// Declare a zero-sized modulus slot implementing [`Modulus`].
 ///
 /// ```ignore
-/// define_modulus!(pub Secp256k1Base, 4);
-/// Secp256k1Base::install_modulus(p);     // once, at proof start
-/// type F = Fp<Secp256k1Base, 4>;
+/// define_modulus!(pub ProofSlot, 4);
+/// ProofSlot::install_modulus(p);     // at proof start (re-install between proofs is fine)
+/// type F = Fp<ProofSlot, 4>;
 /// ```
 #[macro_export]
 macro_rules! define_modulus {
@@ -157,12 +185,12 @@ macro_rules! define_modulus {
 
         impl $crate::field::runtime_monty::Modulus<{ $limbs }> for $name {
             #[inline(always)]
-            fn cell() -> &'static ::std::sync::OnceLock<
+            fn cell() -> &'static ::std::sync::atomic::AtomicPtr<
                 $crate::field::runtime_monty::Params<{ $limbs }>,
             > {
-                static CELL: ::std::sync::OnceLock<
+                static CELL: ::std::sync::atomic::AtomicPtr<
                     $crate::field::runtime_monty::Params<{ $limbs }>,
-                > = ::std::sync::OnceLock::new();
+                > = ::std::sync::atomic::AtomicPtr::new(::std::ptr::null_mut());
                 &CELL
             }
         }
@@ -864,6 +892,36 @@ mod tests {
     fn from_u64_and_new_agree() {
         setup();
         assert_eq!(F::from_u64(12345).retrieve(), U256::from_u64(12345));
+    }
+
+    /// A slot can be re-installed with a different modulus (the per-proof
+    /// random-prime flow): arithmetic follows the newest install, and the
+    /// same-modulus re-install is a no-op. Uses a dedicated slot so the
+    /// property tests above (which share `TestMod`) are unaffected.
+    #[test]
+    fn slot_reinstall_switches_modulus() {
+        define_modulus!(ReinstallMod, 4);
+        type G = Fp<ReinstallMod, 4>;
+        assert!(ReinstallMod::try_params().is_none());
+
+        let p1 = U256::from_u64(101);
+        let p2 = U256::from_u64(103);
+        ReinstallMod::install_modulus(p1);
+        assert_eq!((G::from_u64(100) + G::from_u64(2)).retrieve(), U256::ONE);
+        let params_before = ReinstallMod::params() as *const _;
+        ReinstallMod::install_modulus(p1);
+        assert!(core::ptr::eq(params_before, ReinstallMod::params()), "same modulus: no-op");
+
+        ReinstallMod::install_modulus(p2);
+        assert_eq!(
+            (G::from_u64(100) + G::from_u64(2)).retrieve(),
+            U256::from_u64(102),
+            "arithmetic must follow the newly installed modulus"
+        );
+        assert_eq!(
+            (G::from_u64(102) + G::from_u64(2)).retrieve(),
+            U256::ONE
+        );
     }
 
     proptest! {

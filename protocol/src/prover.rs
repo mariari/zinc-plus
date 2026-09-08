@@ -375,10 +375,13 @@ impl_with_type_bounds!(ProverBase
         project_scalar: S,
     ) -> Result<(F::Config, ScalarMap<U::Scalar, DynamicPolynomialF<F>>), ProtocolError<F, U::Ideal>>
     {
-        // `fixed-prime` branch: use the secp256k1 base field prime as the
-        // projecting prime instead of drawing one from the transcript.
-        // See `crate::fixed_prime` for the soundness caveat.
-        let field_cfg = crate::fixed_prime::secp256k1_field_cfg::<F, Zt::Fmod>();
+        // Step 1: the projecting prime — drawn from the transcript unless
+        // the type bundle pins one (`Zt::FIXED_PROJECTING_PRIME`; see
+        // `crate::fixed_prime` for the soundness caveat of pinning).
+        let field_cfg = crate::fixed_prime::projecting_field_cfg::<F, Zt::Fmod, Zt::PrimeTest, _>(
+            Zt::FIXED_PROJECTING_PRIME,
+            &mut self.pcs_transcript.fs_transcript,
+        );
 
         let projected_scalars_fx = project_scalars::<F, U>(|s| project_scalar(s, &field_cfg));
         Ok((field_cfg, projected_scalars_fx))
@@ -1474,13 +1477,15 @@ where
     absorb_public_columns(&mut pcs_transcript.fs_transcript, &public_trace.int);
 
     // ── Step 1: Prime projection ────────────────────────────────────────
-    // `fixed-prime` branch: match the non-folded path (see
-    // `ProverCommitted::project_common`) and use the secp256k1 base
-    // prime as the projecting prime instead of drawing one from the
-    // transcript. UAIRs whose constraints are secp256k1-specific
-    // algebraic identities (e.g. `EcdsaUair`) only hold under this
-    // prime, so a random prime here would break verification.
-    let field_cfg = crate::fixed_prime::secp256k1_field_cfg::<F, ZtF::Fmod>();
+    // Match the non-folded path (see `ProverCommitted::project_common`):
+    // draw the projecting prime from the transcript unless the type
+    // bundle pins one. UAIRs whose constraints are secp256k1-specific
+    // algebraic identities (e.g. `EcdsaUair`) only hold under that prime,
+    // so their bundles pin it (`FIXED_PROJECTING_PRIME = Some(secp)`).
+    let field_cfg = crate::fixed_prime::projecting_field_cfg::<F, ZtF::Fmod, ZtF::PrimeTest, _>(
+        ZtF::FIXED_PROJECTING_PRIME,
+        &mut pcs_transcript.fs_transcript,
+    );
     let projected_scalars_fx = project_scalars::<F, U>(|s| project_scalar(s, &field_cfg));
 
     // ── Step 2: Ideal check (lane chosen by MLE_FIRST + UAIR shape) ─────
@@ -2251,7 +2256,10 @@ where
 
     // ── Step 1: Prime projection ────────────────────────────────────────
     let _t_step1 = std::time::Instant::now();
-    let field_cfg = crate::fixed_prime::secp256k1_field_cfg::<F, ZtF::Fmod>();
+    let field_cfg = crate::fixed_prime::projecting_field_cfg::<F, ZtF::Fmod, ZtF::PrimeTest, _>(
+        ZtF::FIXED_PROJECTING_PRIME,
+        &mut pcs_transcript.fs_transcript,
+    );
     let projected_scalars_fx = project_scalars::<F, U>(|s| project_scalar(s, &field_cfg));
     if let Some(t) = timings.as_mut() {
         t.step1_prime_projection = _t_step1.elapsed();

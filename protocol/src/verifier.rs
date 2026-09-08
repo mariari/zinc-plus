@@ -353,17 +353,18 @@ where
     U: Uair,
     IdealOverF: Ideal,
 {
-    /// Step 1: Prime projection. Builds the field configuration from the
-    /// fixed projecting prime (secp256k1 base prime; see `crate::fixed_prime`).
+    /// Step 1: Prime projection. Re-derives the projecting prime exactly
+    /// as the prover did: from the transcript (whose state now matches the
+    /// prover's after step 0), or the pinned `Zt::FIXED_PROJECTING_PRIME`.
     #[allow(clippy::type_complexity)]
     pub fn step1_prime_projection(
-        self,
+        mut self,
     ) -> Result<VerifierPrimeProjected<'a, Zt, U, F, IdealOverF, D>, ProtocolError<F, IdealOverF>>
     {
-        // `fixed-prime` branch: use the secp256k1 base field prime as the
-        // projecting prime instead of drawing one from the transcript.
-        // See `crate::fixed_prime` for the soundness caveat.
-        let field_cfg = crate::fixed_prime::secp256k1_field_cfg::<F, Zt::Fmod>();
+        let field_cfg = crate::fixed_prime::projecting_field_cfg::<F, Zt::Fmod, Zt::PrimeTest, _>(
+            Zt::FIXED_PROJECTING_PRIME,
+            &mut self.base.pcs_transcript.fs_transcript,
+        );
 
         Ok(VerifierPrimeProjected {
             base: self.base,
@@ -1436,11 +1437,12 @@ where
     absorb_public_columns(&mut pcs_transcript.fs_transcript, &public_trace.int);
 
     // ── Step 1: Prime projection ────────────────────────────────────────
-    // `fixed-prime` branch: match the non-folded path and use the
-    // secp256k1 base prime as the projecting prime. See the prover-side
-    // comment in `prove_folded` for why UAIRs with EC arithmetic need
-    // the fixed prime here.
-    let field_cfg = crate::fixed_prime::secp256k1_field_cfg::<F, ZtF::Fmod>();
+    // Match the prover: transcript-drawn prime unless the bundle pins one
+    // (see the prover-side comment in `prove_folded`).
+    let field_cfg = crate::fixed_prime::projecting_field_cfg::<F, ZtF::Fmod, ZtF::PrimeTest, _>(
+        ZtF::FIXED_PROJECTING_PRIME,
+        &mut pcs_transcript.fs_transcript,
+    );
 
     // ── Step 2: Ideal check ─────────────────────────────────────────────
     let num_constraints = count_constraints::<U>();
@@ -2162,7 +2164,10 @@ where
 
     // ── Step 1: Prime projection ────────────────────────────────────────
     let _t_step1 = std::time::Instant::now();
-    let field_cfg = crate::fixed_prime::secp256k1_field_cfg::<F, ZtF::Fmod>();
+    let field_cfg = crate::fixed_prime::projecting_field_cfg::<F, ZtF::Fmod, ZtF::PrimeTest, _>(
+        ZtF::FIXED_PROJECTING_PRIME,
+        &mut pcs_transcript.fs_transcript,
+    );
     if let Some(t) = timings.as_mut() {
         t.step1_prime_projection = _t_step1.elapsed();
     }
