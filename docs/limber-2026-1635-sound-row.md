@@ -423,3 +423,47 @@ per cell), the GKR layer sumchecks 0.8 s, the CPR constraint closure
 - **Verifier (18 ms)**: the table-side `q̃` evaluation of the `Word`
   table has a closed form (`β − Σ_i 2^i r_i` for a full power-of-two
   table) that would remove 2^16 field multiplications; not done.
+
+### Results after this pass (commits `de19d57..789e152`)
+
+Same machine and methodology as §4 (Apple M4, `simd unchecked
+iprs-rate-1-8`, LTO, `-C target-cpu=native`, medians of 3; MT = the
+`parallel` feature on 10 cores). The proof is the same argument with the
+same security parameters; only the wire format of the multiplicities and
+the combination-ring width changed.
+
+| `LIMB16=1 NVARS=13` | before (§4) | after | change |
+|---|---|---|---|
+| prove, ST | 5.306 s (5.074 s re-measured) | **2.083 s** | 2.4× |
+| prove + witness gen, ST | 5.446 s | 2.211 s | |
+| verify, ST | 26.3 ms (21.1 re-measured) | **18.1 ms** | −14 % |
+| proof raw / zstd | 2.33 MB / 881 KiB | **1.27 MB / 846 KiB** | −47 % / −4 % |
+| prove, MT (10 cores) | 2.205 s | **0.545 s** | 4.0× |
+| verify, MT | 18.2 ms | 12.5 ms | |
+| `sec-128` prove, ST | 7.353 s | **2.814 s** | 2.6× |
+| `sec-128` verify / raw / zstd | 26.8 ms / 3.11 MB / 1.08 MB | 22.1 ms / 1.55 MB / 1.04 MB | |
+
+Against Limber's single-threaded rows (their M4 Pro: Brakedown 1.18 s /
+45 ms / 5.3 MB raw, Hyrax 1.32 s / 39 ms / 170 KB): the sound Zinc+ row
+now proves 1.6–1.8× slower instead of 4–4.5×, verifies 2.2–2.5× faster,
+and its raw proof is 4.2× smaller than Limber-Brakedown.
+
+Per-step breakdown (`STEPS=1`, one run, ST; the MT column is the same
+run with `parallel`):
+
+| step | before | after ST | after MT |
+|---|---|---|---|
+| 0 Zip+ commit (512 int cols) | 2.382 s | 0.990 s (encode 0.68, Merkle 0.33) | 0.191 s |
+| 1 prime projection | 0.060 s | 0.039 s | 0.010 s |
+| 2 ideal check | 0.189 s | 0.057 s | 0.009 s |
+| 3 eval projection | 0.027 s | 0.012 s | 0.002 s |
+| 4 CPR sumcheck | 0.423 s | 0.330 s | 0.052 s |
+| 4b lookup (GKR-LogUp) | 0.933 s | 0.453 s | 0.187 s |
+| 5 multipoint eval | 0.070 s | 0.062 s | 0.015 s |
+| 6 lift-and-project | 0.237 s | 0.048 s | 0.034 s |
+| 7 PCS open (+ reducer) | 0.977 s | 0.060 s | 0.031 s |
+| total | 5.298 s | 2.052 s | 0.532 s |
+
+The single-threaded prover is now half commitment (encode + Blake3 of
+the 512 MB codeword), a fifth lookup GKR and a sixth CPR; the
+multi-threaded one is a third commit and a third lookup GKR.

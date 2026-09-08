@@ -1150,7 +1150,9 @@ fn $ufn(num_vars: usize, reps: usize) {
         for (name, t) in &times {
             eprintln!("      {name:<28} {t:8.3} s  ({:5.1}%)", 100.0 * t / total);
         }
-        eprintln!("      (0 commit, int lane re-run: encode {t_enc:.3} s, merkle {t_mt:.3} s)");
+        eprintln!(
+            "      (0 commit, int lane re-run, one column at a time: encode {t_enc:.3} s, merkle {t_mt:.3} s)"
+        );
     }
 }
     };
