@@ -649,7 +649,7 @@ const LIMB_BITS: u32 = 16;
 const LIMBS_PER_VALUE: usize = 2048 / LIMB_BITS as usize; // 128
 const LIMB_COLS: usize = 4 * LIMBS_PER_VALUE; // a | b | c | u
 const LIMB_INT: usize = 1; // one 64-bit limb per 16-bit cell (sign headroom included)
-const LIMB_CW: usize = 3; // codeword growth of the IPRS encoder
+const LIMB_CW: usize = 2; // 128-bit codeword entries: the encoder grows 16-bit limbs by < 112 bits (CHECKED-validated at nvars = 13)
 const LIMB_M: usize = 6; // combination ring: Cw + 128-bit alphas/coeffs + row sums
 
 type LimbInt = Int<LIMB_INT>;
@@ -1012,6 +1012,45 @@ fn $ufn(num_vars: usize, reps: usize) {
         ),
         &proof,
     );
+
+    // `STEPS=1`: one more prove, driven step by step, with per-step wall
+    // times (single run, not a median — indicative only).
+    if std::env::var("STEPS").is_ok() {
+        let mut lap = Instant::now();
+        let mut times: Vec<(&str, f64)> = Vec::new();
+        macro_rules! lap {
+            ($name:literal) => {{
+                times.push(($name, lap.elapsed().as_secs_f64()));
+                lap = Instant::now();
+            }};
+        }
+        let s = <piop!()>::step0_commit(&pp, &trace, num_vars).expect("step0");
+        lap!("0 commit");
+        let s = s.step1_combined(zinc_protocol::project_scalar_fn).expect("step1");
+        lap!("1 prime projection");
+        let s = s.step2_ideal_check().expect("step2");
+        lap!("2 ideal check");
+        let s = s.step3_eval_projection().expect("step3");
+        lap!("3 eval projection");
+        let s = s.step4_sumcheck().expect("step4");
+        lap!("4 CPR+booleanity sumcheck");
+        let s = s.step4b_lookup().expect("step4b");
+        lap!("4b lookup (GKR-LogUp)");
+        let s = s.step5_multipoint_eval().expect("step5");
+        lap!("5 multipoint eval");
+        let s = s.step6_lift_and_project().expect("step6");
+        lap!("6 lift-and-project");
+        let s = s.step7_pcs_open::<PERFORM_CHECKS>().expect("step7");
+        lap!("7 PCS open (+reducers)");
+        let p: Proof<F> = s.finish().expect("finish");
+        lap!("8 assembly");
+        black_box(p);
+        let total: f64 = times.iter().map(|(_, t)| t).sum();
+        eprintln!("    per-step prover times (one run, total {total:.3} s):");
+        for (name, t) in &times {
+            eprintln!("      {name:<28} {t:8.3} s  ({:5.1}%)", 100.0 * t / total);
+        }
+    }
 }
     };
 }

@@ -48,7 +48,7 @@ use zinc_poly::{
 use zinc_primality::PrimalityTest;
 use zinc_transcript::traits::{ConstTranscribable, GenTranscribable, Transcribable, Transcript};
 use zinc_uair::{Uair, ideal::Ideal};
-use zinc_utils::{cfg_extend, cfg_into_iter, cfg_iter, named::Named};
+use zinc_utils::{cfg_extend, cfg_into_iter, cfg_iter, mul, named::Named};
 use zip_plus::{
     ZipError,
     code::LinearCode,
@@ -171,7 +171,7 @@ where
                 let (n, rest) = u32::read_transcription_bytes_subset(rest);
                 let n = usize::try_from(n).expect("int eval count must fit in usize");
                 let inner_size = F::Inner::NUM_BYTES;
-                let (evals_bytes, rest) = rest.split_at(n * inner_size);
+                let (evals_bytes, rest) = rest.split_at(mul!(n, inner_size));
                 let evals = zinc_transcript::read_field_vec_with_cfg::<F>(evals_bytes, &cfg);
                 (Some(rp), evals, rest)
             }

@@ -41,7 +41,7 @@ use zinc_uair::{
     ideal_collector::IdealOrZero,
 };
 use zinc_utils::{
-    add, cfg_join, from_ref::FromRef, inner_transparent_field::InnerTransparentField,
+    add, sub, cfg_join, from_ref::FromRef, inner_transparent_field::InnerTransparentField,
     mul_by_scalar::MulByScalar, projectable_to_field::ProjectableToField,
 };
 use zip_plus::{
@@ -862,10 +862,10 @@ where
         let num_total_bin = total_cols.num_binary_poly_cols();
         let num_total_arb = total_cols.num_arbitrary_poly_cols();
         let num_pub_int = pub_cols.num_int_cols();
-        let num_wit_int = total_cols.num_int_cols() - num_pub_int;
+        let num_wit_int = sub!(total_cols.num_int_cols(), num_pub_int);
         let int_offset = add!(add!(num_total_bin, num_total_arb), num_pub_int);
         let bin_batch_size = self.proof_commitments.0.batch_size;
-        if bin_batch_size != num_total_bin - num_pub_bin
+        if bin_batch_size != sub!(num_total_bin, num_pub_bin)
             || self.proof_commitments.2.batch_size != num_wit_int
         {
             return Err(ProtocolError::Lookup(
@@ -893,7 +893,7 @@ where
                             zinc_piop::lookup::LookupError::NotImplemented,
                         ));
                     }
-                    let wit_idx = full_col_idx - int_offset;
+                    let wit_idx = sub!(full_col_idx, int_offset);
                     if lift_scalar(&sub.combined_polynomial[ell], &zero)
                         != group_proof.int_evals_at_r_inner[wit_idx]
                     {
@@ -1196,7 +1196,7 @@ where
             .iter()
             .filter(|m| matches!(m.table_type, LookupTableType::BitPoly { .. }))
             .count();
-        let n_int_groups = self.proof_lookup_proof.group_meta.len() - n_groups;
+        let n_int_groups = sub!(self.proof_lookup_proof.group_meta.len(), n_groups);
         let reducer_present = self.proof_bin_reducer.is_some();
         // G >= 1 now always uses the reducer (one folded open); only the
         // no-lookup G = 0 case opens the bin commitment directly at r_0.
@@ -1370,7 +1370,7 @@ where
         // into ONE int open at the reduced point; otherwise open at r_0.
         match &self.proof_int_reducer {
             Some(reducer_proof) => {
-                let num_wit_int = total.num_int_cols() - num_pub_int;
+                let num_wit_int = sub!(total.num_int_cols(), num_pub_int);
                 let int_offset = add!(add!(num_total_bin, num_total_arb), num_pub_int);
                 if commitments.2.batch_size != num_wit_int
                     || self.proof_int_evals_at_r_star.len() != num_wit_int
@@ -1381,7 +1381,7 @@ where
                     ));
                 }
                 let zero = F::zero_with_cfg(field_cfg);
-                let mut claims: Vec<ReducerIntClaim<F>> = Vec::with_capacity(n_int_groups + 1);
+                let mut claims: Vec<ReducerIntClaim<F>> = Vec::with_capacity(add!(n_int_groups, 1));
                 for ((group_proof, meta), r_inner) in self
                     .proof_lookup_proof
                     .groups

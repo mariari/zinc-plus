@@ -41,7 +41,7 @@ use zinc_uair::{
 };
 use zinc_utils::{
     add, cfg_join, from_ref::FromRef, inner_transparent_field::InnerTransparentField,
-    mul_by_scalar::MulByScalar, projectable_to_field::ProjectableToField,
+    mul_by_scalar::MulByScalar, projectable_to_field::ProjectableToField, sub,
 };
 use zip_plus::{
     pcs::{
@@ -856,7 +856,7 @@ impl_with_type_bounds!(ProverSumchecked
                     let num_total_bin = total.num_binary_poly_cols();
                     let num_total_arb = total.num_arbitrary_poly_cols();
                     let num_pub_int = pub_cols.num_int_cols();
-                    let num_wit_int = total.num_int_cols() - num_pub_int;
+                    let num_wit_int = sub!(total.num_int_cols(), num_pub_int);
                     let int_offset = add!(add!(num_total_bin, num_total_arb), num_pub_int);
                     let mut parent_refs = Vec::with_capacity(parent_indices.len());
                     for &idx in &parent_indices {
@@ -865,7 +865,7 @@ impl_with_type_bounds!(ProverSumchecked
                                 zinc_piop::lookup::LookupError::NotImplemented,
                             ));
                         }
-                        parent_refs.push(&witness_trace.int[idx - int_offset]);
+                        parent_refs.push(&witness_trace.int[sub!(idx, int_offset)]);
                     }
                     let instance = IntLookupInstance::<'_, Zt::Int> {
                         parent_columns: parent_refs,
@@ -890,7 +890,7 @@ impl_with_type_bounds!(ProverSumchecked
                     let zero = F::zero_with_cfg(&self.field_cfg);
                     let mut evals: Vec<Option<F>> = vec![None; num_wit_int];
                     for (ell, &col) in sub.parent_columns.iter().enumerate() {
-                        evals[col - int_offset] =
+                        evals[sub!(col, int_offset)] =
                             Some(lift_scalar(&sub.combined_polynomial[ell], &zero));
                     }
                     let non_parent: Vec<usize> =
@@ -1320,30 +1320,21 @@ impl_with_type_bounds!(ProverLifted
             .filter(|(_, m)| matches!(m.table_type, LookupTableType::Word { .. }))
             .map(|(g, _)| g)
             .collect();
-        let (int_reducer_proof, int_evals_at_r_star) = if int_group_idx.is_empty()
-            || self.base.hint_int.is_none()
+        let int_hint_with_groups = match &self.base.hint_int {
+            Some(hint_int) if !int_group_idx.is_empty() => Some(hint_int),
+            _ => None,
+        };
+        let (int_reducer_proof, int_evals_at_r_star) = if let Some(hint_int) = int_hint_with_groups
         {
-            if let Some(hint_int) = &self.base.hint_int {
-                let _ = ZipPlus::<Zt::IntZt, Zt::IntLc>::prove_f::<_, CHECK_FOR_OVERFLOW>(
-                    &mut self.base.pcs_transcript,
-                    self.base.pp_int,
-                    &witness_trace.int,
-                    &self.r_0,
-                    hint_int,
-                    &self.field_cfg,
-                )?;
-            }
-            (None, Vec::new())
-        } else {
             let num_total_arb = total.num_arbitrary_poly_cols();
             let num_pub_int = pub_cols.num_int_cols();
             let int_offset = add!(add!(num_total_bin, num_total_arb), num_pub_int);
-            let num_wit_int = total.num_int_cols() - num_pub_int;
+            let num_wit_int = sub!(total.num_int_cols(), num_pub_int);
             let int_cols_f: &[DenseMultilinearExtension<F::Inner>] =
                 &self.projected_trace_f[int_offset..add!(int_offset, num_wit_int)];
             let zero = F::zero_with_cfg(&self.field_cfg);
 
-            let mut claims: Vec<ReducerIntClaim<F>> = Vec::with_capacity(int_group_idx.len() + 1);
+            let mut claims: Vec<ReducerIntClaim<F>> = Vec::with_capacity(add!(int_group_idx.len(), 1));
             for &g in &int_group_idx {
                 claims.push(ReducerIntClaim {
                     point: self.lookup_r_inners[g].clone(),
@@ -1380,7 +1371,6 @@ impl_with_type_bounds!(ProverLifted
                 .fs_transcript
                 .absorb_random_field_slice(&int_evals_r_star, &mut buf);
 
-            let hint_int = self.base.hint_int.as_ref().expect("int lane committed");
             let _ = ZipPlus::<Zt::IntZt, Zt::IntLc>::prove_f::<_, CHECK_FOR_OVERFLOW>(
                 &mut self.base.pcs_transcript,
                 self.base.pp_int,
@@ -1390,6 +1380,18 @@ impl_with_type_bounds!(ProverLifted
                 &self.field_cfg,
             )?;
             (Some(reducer_proof), int_evals_r_star)
+        } else {
+            if let Some(hint_int) = &self.base.hint_int {
+                let _ = ZipPlus::<Zt::IntZt, Zt::IntLc>::prove_f::<_, CHECK_FOR_OVERFLOW>(
+                    &mut self.base.pcs_transcript,
+                    self.base.pp_int,
+                    &witness_trace.int,
+                    &self.r_0,
+                    hint_int,
+                    &self.field_cfg,
+                )?;
+            }
+            (None, Vec::new())
         };
 
         Ok(ProverPcsOpened {

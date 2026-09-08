@@ -598,6 +598,7 @@ pub struct IntLookupInstance<'a, I> {
 /// must be zero (which also rejects negative two's-complement values), and
 /// the low 64-bit value must be `< 2^width`. `buf` must be
 /// `I::NUM_BYTES` long (scratch space).
+#[allow(clippy::arithmetic_side_effects)] // `width < 64` is checked before the shift
 pub fn int_table_index<I: ConstTranscribable>(v: &I, width: usize, buf: &mut [u8]) -> Option<u64> {
     debug_assert_eq!(buf.len(), I::NUM_BYTES);
     v.write_transcription_bytes_exact(buf);
