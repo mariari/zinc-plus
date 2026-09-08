@@ -49,7 +49,59 @@ where
     let num_rows = trace_matrix.len();
 
     let bit_op_count = uair_sig.bit_op_down_count();
-    let mut max_degrees_and_combined_poly_rows: Vec<(usize, Vec<DynamicPolynomialF<F>>)> =
+
+    // Scalar fast path: without polynomial-valued (binary / arbitrary)
+    // columns and bit-op virtual columns every projected cell is a
+    // degree-0 polynomial, and if every projected scalar is one too the
+    // constraints can be evaluated over `F` directly — no `F_q[X]`
+    // allocation per operation — producing the same degree-0 values.
+    let scalar_only = uair_sig.total_cols().num_binary_poly_cols() == 0
+        && uair_sig.total_cols().num_arbitrary_poly_cols() == 0
+        && bit_op_count == 0
+        && projected_scalars
+            .values()
+            .all(|p| p.degree().unwrap_or(0) == 0);
+    let mut max_degrees_and_combined_poly_rows: Vec<(usize, Vec<DynamicPolynomialF<F>>)> = if scalar_only {
+        let scalar_of = |p: &DynamicPolynomialF<F>| -> F {
+            p.coeffs.first().cloned().unwrap_or_else(|| field_zero.clone())
+        };
+        let scalars_f: ScalarMap<U::Scalar, F> = projected_scalars
+            .iter()
+            .map(|(k, v)| (k.clone(), scalar_of(v)))
+            .collect();
+        cfg_into_iter!(0..num_rows - 1)
+            .map(|row_idx| {
+                let up: Vec<F> = trace_matrix[row_idx].iter().map(scalar_of).collect();
+                let down: Vec<F> = uair_sig
+                    .shifts()
+                    .iter()
+                    .map(|spec| {
+                        if row_idx + spec.shift_amount() < num_rows {
+                            scalar_of(
+                                &trace_matrix[row_idx + spec.shift_amount()][spec.source_col()],
+                            )
+                        } else {
+                            field_zero.clone()
+                        }
+                    })
+                    .collect();
+                let values = combine_scalar_row::<F, U>(
+                    &up,
+                    &down,
+                    num_constraints,
+                    &scalars_f,
+                    down_layout,
+                );
+                (
+                    0,
+                    values
+                        .into_iter()
+                        .map(|v| DynamicPolynomialF::new_trimmed(vec![v]))
+                        .collect(),
+                )
+            })
+            .collect()
+    } else {
         cfg_into_iter!(0..num_rows - 1)
             .map(|row_idx| {
                 let up = &trace_matrix[row_idx];
@@ -89,7 +141,8 @@ where
                     bit_op_count,
                 )
             })
-            .collect();
+            .collect()
+    };
 
     let max_degree = *max_degrees_and_combined_poly_rows
         .iter()
@@ -114,6 +167,68 @@ where
         field_zero.inner(),
         skip_constraints,
     )
+}
+
+/// The scalar twin of [`combine_rows_and_get_max_degree`]: the
+/// constraint values of one row whose cells and scalars are all scalars
+/// (degree-0 projections), evaluated over `F`.
+fn combine_scalar_row<F, U>(
+    up: &[F],
+    down: &[F],
+    num_constraints: usize,
+    scalars_f: &ScalarMap<U::Scalar, F>,
+    down_layout: &ColumnLayout,
+) -> Vec<F>
+where
+    F: PrimeField,
+    U: Uair,
+{
+    let mut builder = ScalarRowBuilder {
+        values: Vec::with_capacity(num_constraints),
+    };
+    let cache: RefCell<Option<ScalarProjCache<U::Scalar, F>>> = RefCell::new(None);
+    let project = |x: &U::Scalar| -> F {
+        if let Some(v) = cache.borrow().as_ref().and_then(|c| c.get(x)) {
+            return v;
+        }
+        let v = scalars_f
+            .get(x)
+            .cloned()
+            .expect("all scalars should have been projected at this point");
+        cache
+            .borrow_mut()
+            .get_or_insert_with(ScalarProjCache::new)
+            .push(x, v.clone());
+        v
+    };
+
+    U::constrain_general(
+        &mut builder,
+        TraceRow::from_slice_with_layout(up, U::signature().total_cols().as_column_layout()),
+        TraceRow::from_slice_with_layout_and_bit_op(down, down_layout, 0),
+        &project,
+        |x, y| Some(project(y) * x),
+        ImpossibleIdeal::from_ref,
+    );
+    builder.values
+}
+
+/// Collects the per-constraint values of one row evaluated over `F`.
+struct ScalarRowBuilder<F> {
+    values: Vec<F>,
+}
+
+impl<F: PrimeField> ConstraintBuilder for ScalarRowBuilder<F> {
+    type Expr = F;
+    type Ideal = ImpossibleIdeal;
+
+    fn assert_in_ideal(&mut self, expr: Self::Expr, _ideal: &Self::Ideal) {
+        self.values.push(expr);
+    }
+
+    fn assert_zero(&mut self, expr: Self::Expr) {
+        self.values.push(expr);
+    }
 }
 
 /// Apply combination polynomial to each row
