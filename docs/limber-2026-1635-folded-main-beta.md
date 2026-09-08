@@ -1,5 +1,12 @@
 # Limber's Zinc+ row, rerun with the folded main-beta pipeline
 
+> **Superseded in part (2026-09-08):** the fixed-prime and no-range-check
+> caveats in §5 no longer describe `main-beta` — see
+> `docs/limber-2026-1635-sound-row.md` for the transcript-drawn prime, the
+> range-checked (`LIMB16=1`) statement, the security-target features and the
+> rerun numbers. The measurements below remain valid for the fat-cell mock
+> at the state of the branch on 2026-08-26.
+
 **Date:** 2026-08-26 · **Machine:** MacBook, Apple M4 (10 cores, 16 GB) —
 same box and methodology as `docs/limber-2026-1635-reproduction.md`
 (2026-08-21, on `bench/limber-repro-main`): single-threaded, `simd

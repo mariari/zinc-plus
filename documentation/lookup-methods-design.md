@@ -4,9 +4,13 @@ Branch: `main-beta-lookup` (off `main-beta`). Status: **M2 (LogUp-GKR) IMPLEMENT
 + e2e-validated** (2026-07-18) — the general primitive is now wired into the
 protocol crate (gkr_logup module + bin_multipoint_reducer + step4b/step7 seam)
 and passes BinLookup16 e2e (G=1 fast path + G≥2 reducer) plus a tamper-reject
-test, with the full protocol suite 23/23 green. The R1 range-check (see
-`range-check-design.md`), Regime-A systematization, and lookups on the real
-SHA-256 UAIR remain future work. Original design menu below.
+test, with the full protocol suite 23/23 green. **2026-09-08:** merged onto
+`main-beta` and extended with the **int-column range check**
+(`LookupTableType::Word { width }` on int columns → `prove_group_int` /
+`verify_group_int` + `int_multipoint_reducer`; see the status paragraph in
+`range-check-design.md`). The R1 vanishing-polynomial range check, Regime-A
+systematization, and lookups on the real SHA-256 UAIR remain future work.
+Original design menu below.
 
 This note lays out a *menu* of ways to do lookups / range checks on the
 integer path (`Z[X] → φ_q → F_q[X] → ψ_α → F_q`), the setting that filters
