@@ -43,6 +43,10 @@ pub enum LookupTableType {
         values: Vec<u64>,
         selections: Vec<Vec<(u32, u32)>>,
     },
+    /// Each pair of selections holds one multiset: the second is a
+    /// permutation of the first. Nothing is prescribed, so the cells stay
+    /// private; the claim is only that the two agree.
+    Permuted { pairs: Vec<(Vec<(u32, u32)>, Vec<(u32, u32)>)> },
 }
 
 impl LookupTableType {
@@ -58,6 +62,7 @@ impl LookupTableType {
     pub fn num_claims(&self, num_columns: usize) -> usize {
         match self {
             Self::Selected { selections, .. } => selections.len(),
+            Self::Permuted { pairs } => mul!(pairs.len(), 2),
             _ => num_columns,
         }
     }
@@ -81,12 +86,15 @@ pub struct LookupColumnSpec {
 // A selected table names its cells too, one list per selection.
 //   [discriminant: u8] [count: u32] [values: count × u64]
 //   [selections: u32] [per selection: [len: u32] [len × (u32, u32)]]
+// A permuted table names two selections a pair, and no values.
+//   [discriminant: u8] [pairs: u32] [per pair: two of [len: u32] [len × (u32, u32)]]
 // ---------------------------------------------------------------------------
 
 const WIDTH_INDEXED_BYTES: usize = 1 + 4 + 1 + 4;
 const PRESCRIBED_HEAD_BYTES: usize = 1 + 4;
 const PRESCRIBED_DISCRIMINANT: u8 = 2;
 const SELECTED_DISCRIMINANT: u8 = 3;
+const PERMUTED_DISCRIMINANT: u8 = 4;
 const CELL_BYTES: usize = 2 * u32::NUM_BYTES;
 
 /// Read a `u32` off the front, returning it and the rest.
@@ -108,8 +116,49 @@ fn write_u32(buf: &mut [u8], value: usize) -> &mut [u8] {
     rest
 }
 
+/// Read one selection off the front, returning it and the rest.
+fn read_selection(bytes: &[u8]) -> (Vec<(u32, u32)>, &[u8]) {
+    let (len, rest) = read_u32(bytes);
+    let (cell_bytes, rest) = rest.split_at(mul!(len, CELL_BYTES));
+    let cells = cell_bytes
+        .chunks_exact(CELL_BYTES)
+        .map(|cell| {
+            (
+                u32::read_transcription_bytes_exact(&cell[..u32::NUM_BYTES]),
+                u32::read_transcription_bytes_exact(&cell[u32::NUM_BYTES..]),
+            )
+        })
+        .collect();
+    (cells, rest)
+}
+
+/// Write one selection at the front, returning the rest.
+fn write_selection<'a>(buf: &'a mut [u8], selection: &[(u32, u32)]) -> &'a mut [u8] {
+    let mut buf = write_u32(buf, selection.len());
+    for (slot, row) in selection {
+        buf = write_u32(buf, *slot as usize);
+        buf = write_u32(buf, *row as usize);
+    }
+    buf
+}
+
+fn selection_bytes(selection: &[(u32, u32)]) -> usize {
+    add!(u32::NUM_BYTES, mul!(selection.len(), CELL_BYTES))
+}
+
 impl GenTranscribable for LookupTableType {
     fn read_transcription_bytes_exact(bytes: &[u8]) -> Self {
+        if bytes[0] == PERMUTED_DISCRIMINANT {
+            let (num_pairs, mut rest) = read_u32(&bytes[1..]);
+            let mut pairs = Vec::with_capacity(num_pairs);
+            for _ in 0..num_pairs {
+                let (first, tail) = read_selection(rest);
+                let (second, tail) = read_selection(tail);
+                pairs.push((first, second));
+                rest = tail;
+            }
+            return Self::Permuted { pairs };
+        }
         if bytes[0] == SELECTED_DISCRIMINANT {
             let (count, rest) = read_u32(&bytes[1..]);
             let (value_bytes, rest) = rest.split_at(mul!(count, u64::NUM_BYTES));
@@ -186,6 +235,15 @@ impl GenTranscribable for LookupTableType {
                 }
                 return;
             }
+            Self::Permuted { pairs } => {
+                buf[0] = PERMUTED_DISCRIMINANT;
+                let mut buf = write_u32(&mut buf[1..], pairs.len());
+                for (first, second) in pairs {
+                    buf = write_selection(buf, first);
+                    buf = write_selection(buf, second);
+                }
+                return;
+            }
             Self::Selected { values, selections } => {
                 buf[0] = SELECTED_DISCRIMINANT;
                 let mut buf = write_u32(&mut buf[1..], values.len());
@@ -233,6 +291,12 @@ impl Transcribable for LookupTableType {
                         total,
                         add!(u32::NUM_BYTES, mul!(selection.len(), CELL_BYTES))
                     )
+                },
+            ),
+            Self::Permuted { pairs } => pairs.iter().fold(
+                add!(1, u32::NUM_BYTES),
+                |total, (first, second)| {
+                    add!(total, add!(selection_bytes(first), selection_bytes(second)))
                 },
             ),
             _ => WIDTH_INDEXED_BYTES,
@@ -295,6 +359,27 @@ mod tests {
                 ],
             },
             LookupTableType::Selected { values: vec![], selections: vec![] },
+        ] {
+            let mut buf = vec![0u8; add!(LookupTableType::LENGTH_NUM_BYTES, table.get_num_bytes())];
+            table.write_transcription_bytes_subset(&mut buf);
+            let (read, rest) = LookupTableType::read_transcription_bytes_subset(&buf);
+            assert_eq!(read, table);
+            assert!(rest.is_empty());
+        }
+    }
+
+    /// A permuted table carries two selections a pair and reads back as
+    /// itself.
+    #[test]
+    fn a_permuted_table_round_trips() {
+        for table in [
+            LookupTableType::Permuted {
+                pairs: vec![
+                    ((0..3).map(|p| (0u32, p)).collect(), (0..3).map(|p| (1u32, p)).collect()),
+                    (vec![(2, 0)], vec![(2, 1)]),
+                ],
+            },
+            LookupTableType::Permuted { pairs: vec![] },
         ] {
             let mut buf = vec![0u8; add!(LookupTableType::LENGTH_NUM_BYTES, table.get_num_bytes())];
             table.write_transcription_bytes_subset(&mut buf);
