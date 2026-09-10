@@ -800,6 +800,41 @@ pub struct SelectedLookupInstance<'a, F: PrimeField> {
     pub n_vars: usize,
 }
 
+/// The selections a permuted table makes, the firsts of its pairs then the
+/// seconds: the tree at `ell + pairs` answers the tree at `ell`.
+fn paired_selections(pairs: &[(Vec<(u32, u32)>, Vec<(u32, u32)>)]) -> Vec<Vec<(u32, u32)>> {
+    pairs
+        .iter()
+        .map(|(first, _)| first.clone())
+        .chain(pairs.iter().map(|(_, second)| second.clone()))
+        .collect()
+}
+
+/// The weight each tree's fraction carries when the roots are crossed:
+/// α^ell, and for the second of a permuted pair the negation of its
+/// first's, so the pair cancels exactly when it holds one multiset.
+#[allow(clippy::arithmetic_side_effects)]
+fn tree_weights<F>(table_type: &LookupTableType, alpha_powers: &[F]) -> Vec<F>
+where
+    F: PrimeField,
+{
+    match table_type {
+        LookupTableType::Permuted { pairs } => {
+            let half = pairs.len();
+            (0..alpha_powers.len())
+                .map(|ell| {
+                    if ell < half {
+                        alpha_powers[ell].clone()
+                    } else {
+                        -alpha_powers[ell - half].clone()
+                    }
+                })
+                .collect()
+        }
+        _ => alpha_powers.to_vec(),
+    }
+}
+
 /// The flat leaf position of every cell each selection names, over the
 /// group's columns laid end to end.
 ///
@@ -852,15 +887,19 @@ where
     F::Modulus: ConstTranscribable,
     F::Config: Sync,
 {
+    // A permuted group is a selected one whose table is empty: the second
+    // selection of each pair is a tree of its own, weighed against the
+    // first when the roots are crossed.
     let (values, selections) = match &instance.table_type {
-        LookupTableType::Selected { values, selections } => (values, selections),
+        LookupTableType::Selected { values, selections } => (values.clone(), selections.clone()),
+        LookupTableType::Permuted { pairs } => (Vec::new(), paired_selections(pairs)),
         _ => return Err(GkrLogupError::WitnessNotInTable),
     };
     let num_columns = instance.parent_columns.len();
     let num_lookups = selections.len();
     let n_vars = instance.n_vars;
     let witness_len = 1usize << n_vars;
-    let positions = selection_positions::<F>(selections, num_columns, witness_len)?;
+    let positions = selection_positions::<F>(&selections, num_columns, witness_len)?;
 
     // The cells the selections read: the group's columns end to end, in
     // the order the specs declare them.
@@ -964,9 +1003,9 @@ where
         LookupTableType::BitPoly { width, chunk_width: None } => (*width, *width),
         LookupTableType::Word { width, chunk_width: Some(cw) } => (*width, *cw),
         LookupTableType::Word { width, chunk_width: None } => (*width, *width),
-        LookupTableType::Prescribed { .. } | LookupTableType::Selected { .. } => {
-            (PRESCRIBED_CHUNK_WIDTH, PRESCRIBED_CHUNK_WIDTH)
-        }
+        LookupTableType::Prescribed { .. }
+        | LookupTableType::Selected { .. }
+        | LookupTableType::Permuted { .. } => (PRESCRIBED_CHUNK_WIDTH, PRESCRIBED_CHUNK_WIDTH),
     };
     assert!(chunk_width > 0 && width % chunk_width == 0);
 
@@ -974,9 +1013,11 @@ where
     // row of lifts; a whole-column lookup reads only its own parent, so it
     // carries one row per parent.
     let selections = match &meta.table_type {
-        LookupTableType::Selected { selections, .. } => Some(selections.as_slice()),
+        LookupTableType::Selected { selections, .. } => Some(selections.clone()),
+        LookupTableType::Permuted { pairs } => Some(paired_selections(pairs)),
         _ => None,
     };
+    let selections = selections.as_deref();
     let num_lookups = meta.num_lookups;
     let num_chunks = meta.num_chunks;
     let witness_len = meta.witness_len;
@@ -1022,6 +1063,8 @@ where
             let multiplicities = vec![one.clone(); values.len()];
             (table, Some(vec![multiplicities; num_lookups]))
         }
+        // No table at all: the second selections are the first ones' table.
+        LookupTableType::Permuted { .. } => (Vec::new(), Some(vec![Vec::new(); num_lookups])),
         _ => (
             generate_bitpoly_table::<F>(chunk_width, projecting_element_f, field_cfg),
             None,
@@ -1060,11 +1103,12 @@ where
 
     // ---- Step 3: Cross-check roots ----
     {
+        let weights = tree_weights(&meta.table_type, &alpha_powers);
         let roots_q = &proof.witness_gkr.roots_q;
         let q_w_product: F = roots_q.iter().cloned().fold(one.clone(), |acc, q| acc * &q);
         let mut lhs = zero.clone();
         if num_lookups == 1 {
-            lhs = lhs + &(alpha_powers[0].clone() * &proof.witness_gkr.roots_p[0]);
+            lhs = lhs + &(weights[0].clone() * &proof.witness_gkr.roots_p[0]);
         } else if num_lookups > 1 {
             let mut prefix = Vec::with_capacity(num_lookups);
             prefix.push(one.clone());
@@ -1077,8 +1121,7 @@ where
             }
             for ell in 0..num_lookups {
                 let others_q = prefix[ell].clone() * &suffix[ell];
-                lhs = lhs
-                    + &(alpha_powers[ell].clone() * &proof.witness_gkr.roots_p[ell] * &others_q);
+                lhs = lhs + &(weights[ell].clone() * &proof.witness_gkr.roots_p[ell] * &others_q);
             }
         }
         lhs = lhs * &proof.table_gkr.root_q;
@@ -1107,7 +1150,8 @@ where
                 combined[j] = combined[j].clone() + &scaled;
                 m_sum = m_sum + &aggregated_multiplicities[ell][j];
             }
-            let expected = leaves_read(ell) as u64;
+            // A permuted group has no table to account for its leaves.
+            let expected = if table_len == 0 { 0 } else { leaves_read(ell) as u64 };
             if m_sum != F::from_with_cfg(expected, field_cfg) {
                 return Err(GkrLogupError::MultiplicitySumMismatch { expected, got: 0 });
             }
@@ -1117,7 +1161,7 @@ where
 
     if table_result.point.is_empty() {
         let expected_p = if table_len > 0 { combined_mults[0].clone() } else { zero.clone() };
-        let expected_q = beta.clone() - &subtable[0];
+        let expected_q = if table_len > 0 { beta.clone() - &subtable[0] } else { one.clone() };
         if expected_p != table_result.expected_p || expected_q != table_result.expected_q {
             return Err(GkrLogupError::GkrLeafMismatch);
         }
@@ -1213,7 +1257,9 @@ where
         // A selection's chunks are whole columns, each standing for
         // itself, so the group's claim is one lift per column and there
         // is nothing to recombine.
-        LookupTableType::Selected { .. } => proof.chunk_lifts[0].clone(),
+        LookupTableType::Selected { .. } | LookupTableType::Permuted { .. } => {
+            proof.chunk_lifts[0].clone()
+        }
         // A cell read as a number recombines to one field element by
         // place value; BitPoly chunks are coefficient blocks.
         LookupTableType::BitPoly { .. } => (0..num_lookups)
@@ -1491,7 +1537,10 @@ mod tests {
 
     /// A 3x3 latin square laid down one row per column, over `rows` rows
     /// so every column has cells no selection names.
-    fn latin_square(square: [[u32; 3]; 3], rows: usize) -> Vec<DenseMultilinearExtension<Inner>> {
+    fn latin_square<const C: usize>(
+        square: [[u32; 3]; C],
+        rows: usize,
+    ) -> Vec<DenseMultilinearExtension<Inner>> {
         let n_vars = zinc_utils::log2(rows) as usize;
         let zero = F::from(0u32).inner().clone();
         square
@@ -1564,6 +1613,72 @@ mod tests {
                 DynamicPolynomialF::new_trimmed(vec![expected])
             );
         }
+    }
+
+    /// Each row of the square beside a sorted copy of itself: three pairs
+    /// over six columns, no value prescribed anywhere.
+    fn sorted_pairs() -> LookupTableType {
+        let pairs = (0..3u32)
+            .map(|r| {
+                (
+                    (0..3u32).map(|p| (r, p)).collect(),
+                    (0..3u32).map(|p| (3 + r, p)).collect(),
+                )
+            })
+            .collect();
+        LookupTableType::Permuted { pairs }
+    }
+
+    fn square_with_sorted_rows() -> Vec<DenseMultilinearExtension<Inner>> {
+        latin_square(
+            [[1, 2, 3], [2, 3, 1], [3, 1, 2], [1, 2, 3], [1, 2, 3], [1, 2, 3]],
+            8,
+        )
+    }
+
+    /// A permuted group proves each pair holds one multiset and verifies
+    /// with the same single row of column claims a selected group leaves.
+    #[test]
+    fn round_trip_permuted_rows() {
+        let a: F = F::from(7u64);
+        let columns = square_with_sorted_rows();
+        let (proof, meta, prover_sub) = prove_latin(&columns, sorted_pairs()).expect("prove");
+        assert_eq!(meta.num_lookups, 6);
+        assert_eq!(proof.chunk_lifts.len(), 1);
+        assert!(proof.aggregated_multiplicities.is_empty());
+        let mut v_ts = Blake3Transcript::new();
+        let sub = verify_group::<F>(&mut v_ts, &proof, &meta, &a, &()).expect("verify");
+        assert_eq!(prover_sub.combined_polynomial, sub.combined_polynomial);
+    }
+
+    /// The values are the prover's own: shifting every cell of a pair by
+    /// the same amount still proves, since nothing prescribes them.
+    #[test]
+    fn a_permuted_pair_prescribes_no_value() {
+        let a: F = F::from(7u64);
+        let columns = latin_square(
+            [[41, 42, 43], [2, 3, 1], [3, 1, 2], [41, 42, 43], [1, 2, 3], [1, 2, 3]],
+            8,
+        );
+        let (proof, meta, _) = prove_latin(&columns, sorted_pairs()).expect("prove");
+        let mut v_ts = Blake3Transcript::new();
+        verify_group::<F>(&mut v_ts, &proof, &meta, &a, &()).expect("verify");
+    }
+
+    /// The teeth: one cell of a sorted copy changed, so the pair holds two
+    /// multisets, and the crossed roots no longer cancel.
+    #[test]
+    fn a_pair_holding_two_multisets_is_refused() {
+        let a: F = F::from(7u64);
+        let mut columns = square_with_sorted_rows();
+        columns[3].evaluations[1] = F::from(9u64).inner().clone();
+        let (proof, meta, _) = prove_latin(&columns, sorted_pairs()).expect("prove");
+        let mut v_ts = Blake3Transcript::new();
+        let res = verify_group::<F>(&mut v_ts, &proof, &meta, &a, &());
+        assert!(
+            matches!(res, Err(GkrLogupError::GkrRootMismatch)),
+            "a pair of two multisets must fail the LogUp identity, got {res:?}"
+        );
     }
 
     /// A cell no selection names is genuinely unconstrained: the lookup

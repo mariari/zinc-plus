@@ -910,7 +910,7 @@ impl_with_type_bounds!(ProverSumchecked
                     // and no table says what that cell may be, so the value
                     // has to be the one the commitment carries.
                     let proved = match &table_type {
-                        LookupTableType::Selected { .. } => {
+                        LookupTableType::Selected { .. } | LookupTableType::Permuted { .. } => {
                             let instance = SelectedLookupInstance::<'_, F> {
                                 parent_columns: parent_indices
                                     .iter()
