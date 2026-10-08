@@ -172,6 +172,151 @@ where
     }
 }
 
+/// [`IprsCode`] for narrow scalar cells: the prover's `encode` runs the
+/// base layer and the first `narrow_stages` radix-8 stages over `i64` and
+/// only then widens to `Zt::Cw` (see
+/// [`pntt::radix8::pntt_widening`]); `encode_wide` and `encode_f` are
+/// those of the wrapped code, so the codeword is the same.
+///
+/// The caller picks `narrow_stages` from the cells' magnitude: with
+/// cells below `2^b`, the `i64` stages stay exact iff
+/// `b + 15 + log2(base_len) + 18 · narrow_stages ≤ 63`. Validate a new
+/// configuration with a `CHECK = true` run (every narrow operation is
+/// overflow-checked there).
+#[derive(Clone)]
+pub struct IprsCodeNarrow<Zt: ZipTypes, Config: PnttConfig, const REP: usize, const CHECK: bool> {
+    code: IprsCode<Zt, Config, REP, CHECK>,
+    narrow_stages: usize,
+}
+
+impl<Zt, Config, const REP: usize, const CHECK: bool> IprsCodeNarrow<Zt, Config, REP, CHECK>
+where
+    Zt: ZipTypes,
+    Config: PnttConfig,
+{
+    /// Wraps `code`, running its first `narrow_stages` stages over `i64`.
+    pub fn new(code: IprsCode<Zt, Config, REP, CHECK>, narrow_stages: usize) -> Result<Self, ZipError> {
+        if narrow_stages > code.pntt_params.depth {
+            return Err(ZipError::InvalidPcsParam(format!(
+                "narrow_stages {narrow_stages} exceeds the code depth {}",
+                code.pntt_params.depth
+            )));
+        }
+        Ok(Self {
+            code,
+            narrow_stages,
+        })
+    }
+
+    pub fn narrow_stages(&self) -> usize {
+        self.narrow_stages
+    }
+}
+
+impl<Zt: ZipTypes, Config, const REP: usize, const CHECK: bool> LinearCode<Zt>
+    for IprsCodeNarrow<Zt, Config, REP, CHECK>
+where
+    Zt: ZipTypes,
+    Config: PnttConfig,
+    Zt::Eval: for<'a> MulByScalar<&'a PnttInt, Zt::Cw> + for<'a> MulByScalar<&'a PnttInt, PnttInt>,
+    Zt::CombR: for<'a> MulByScalar<&'a PnttInt>,
+    Zt::Cw: CheckedAdd + for<'a> MulByScalar<&'a PnttInt> + FromRef<PnttInt>,
+    PnttInt: FromRef<Zt::Eval>,
+{
+    const REPETITION_FACTOR: usize = REP;
+
+    fn encode(&self, row: &[Zt::Eval]) -> Vec<Zt::Cw> {
+        assert_eq!(
+            row.len(),
+            self.code.pntt_params.row_len,
+            "Input length {} does not match expected row length {}",
+            row.len(),
+            self.code.pntt_params.row_len,
+        );
+
+        let mul_in = |v: &Zt::Eval, tw: &PnttInt| -> PnttInt {
+            v.mul_by_scalar::<CHECK>(tw)
+                .expect("Multiplication by twiddle should not overflow")
+        };
+        let mul_mid = |v: &PnttInt, tw: &PnttInt| -> PnttInt {
+            v.mul_by_scalar::<CHECK>(tw)
+                .expect("Multiplication by twiddle should not overflow")
+        };
+        let mul_out = |v: &Zt::Cw, tw: &PnttInt| -> Zt::Cw {
+            v.mul_by_scalar::<CHECK>(tw)
+                .expect("Multiplication by twiddle should not overflow")
+        };
+
+        pntt::radix8::pntt_widening::<_, PnttInt, _, _, CHECK>(
+            row,
+            &self.code.pntt_params,
+            self.narrow_stages,
+            mul_in,
+            mul_mid,
+            mul_out,
+        )
+    }
+
+    fn row_len(&self) -> usize {
+        self.code.row_len()
+    }
+
+    fn codeword_len(&self) -> usize {
+        self.code.codeword_len()
+    }
+
+    fn params_string(&self) -> String {
+        format!(
+            "{}, narrow_stages={}",
+            self.code.params_string(),
+            self.narrow_stages
+        )
+    }
+
+    fn encode_wide(&self, row: &[Zt::CombR]) -> Vec<Zt::CombR> {
+        self.code.encode_wide(row)
+    }
+
+    fn encode_f<F>(&self, row: &[F]) -> Vec<F>
+    where
+        F: FromPrimitiveWithConfig + FromRef<F>,
+    {
+        self.code.encode_f(row)
+    }
+}
+
+impl<Zt, Config, const REP: usize, const CHECK: bool> Debug
+    for IprsCodeNarrow<Zt, Config, REP, CHECK>
+where
+    Zt: ZipTypes,
+    Config: PnttConfig,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IprsCodeNarrow")
+            .field("code", &self.code)
+            .field("narrow_stages", &self.narrow_stages)
+            .finish()
+    }
+}
+
+impl<Zt, Config, const REP: usize, const CHECK: bool> PartialEq
+    for IprsCodeNarrow<Zt, Config, REP, CHECK>
+where
+    Config: PnttConfig,
+    Zt: ZipTypes,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.code == other.code && self.narrow_stages == other.narrow_stages
+    }
+}
+
+impl<Zt, Config, const REP: usize, const CHECK: bool> Eq for IprsCodeNarrow<Zt, Config, REP, CHECK>
+where
+    Zt: ZipTypes,
+    Config: PnttConfig,
+{
+}
+
 impl<Zt, Config, const REP: usize, const CHECK: bool> Debug for IprsCode<Zt, Config, REP, CHECK>
 where
     Zt: ZipTypes,

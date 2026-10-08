@@ -125,7 +125,7 @@ where
                             continue;
                         }
                         if let Some(w) = &weights[i] {
-                            acc += w.clone();
+                            acc += w;
                         }
                     }
                     acc.into_inner()
@@ -363,11 +363,14 @@ impl<F: InnerTransparentField + FromPrimitiveWithConfig + Send + Sync> CombinedP
         };
 
         let projected_scalars = projected_scalars.clone();
+        // Captured once: rebuilding the signature per evaluation would
+        // allocate its column / lookup spec vectors on every `comb_fn` call.
+        let up_layout = uair_sig.total_cols().as_column_layout().clone();
+        let down_layout = uair_sig.down_cols().as_column_layout().clone();
+        let bit_op_count = uair_sig.bit_op_down_count();
         let comb_fn: CombFn<F> = Box::new(move |mle_values: &[F]| {
-            let uair_sig = U::signature();
-            let up_layout = uair_sig.total_cols().as_column_layout();
-            let down_layout = uair_sig.down_cols().as_column_layout();
-            let bit_op_count = uair_sig.bit_op_down_count();
+            let up_layout = &up_layout;
+            let down_layout = &down_layout;
 
             let selector = &mle_values[0];
             let eq_r = &mle_values[1];

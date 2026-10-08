@@ -5,7 +5,7 @@
 //! for a different lookup design) — the GKR-LogUp module keeps its own
 //! types so the existing scaffolding stays untouched.
 
-use crypto_primitives::PrimeField;
+use crypto_primitives::{FromPrimitiveWithConfig, PrimeField};
 use thiserror::Error;
 use zinc_poly::{
     EvaluationError,
@@ -14,7 +14,7 @@ use zinc_poly::{
 };
 use zinc_transcript::traits::{ConstTranscribable, GenTranscribable, Transcribable};
 use zinc_uair::LookupTableType;
-use zinc_utils::{add, mul};
+use zinc_utils::{add, inner_transparent_field::InnerTransparentField, mul};
 
 use crate::sumcheck::{SumCheckError, SumcheckProof};
 
@@ -127,6 +127,14 @@ pub struct GkrLogupGroupProof<F: PrimeField> {
     /// non-parent columns' entries get bound transitively via the same
     /// alpha-projection (any tampering breaks the Zip+ verify).
     pub bin_lifts_at_r_inner: Vec<DynamicPolynomialF<F>>,
+    /// Int-group counterpart of `bin_lifts_at_r_inner`: the scalar MLE
+    /// evaluation of every witness **int** column at this group's
+    /// `r_inner`, in witness-int-col index order (length = the int
+    /// commitment's batch size; empty for `BitPoly` groups). Parent
+    /// columns' entries are cross-checked against `chunk_lifts[0][k]`; the
+    /// whole vector is bound to the int commitment by the step-7 int
+    /// multipoint reducer's single Zip+ open at `r*`.
+    pub int_evals_at_r_inner: Vec<F>,
 }
 
 /// Static metadata for one lookup group, ported alongside the proof so
@@ -313,6 +321,124 @@ fn read_u32_prefix(bytes: &[u8]) -> (usize, &[u8]) {
         usize::try_from(v).expect("u32 must fit in usize"),
         rest,
     )
+}
+
+// ---------- multiplicities as compact counts ----------
+//
+// The aggregated multiplicities are counts (`< 2^64`; the honest values
+// sum to the number of looked-up cells), so they are serialized as
+// little-endian integers of a per-vector byte width (1, 2, 4 or 8) rather
+// than as field elements: for a `Word{16}` table that is 64 KiB instead
+// of 1 MiB. Prover and verifier still absorb the *field elements* into
+// the transcript (the reader rebuilds exactly the elements the prover
+// absorbed), so the argument and the verifier are unchanged.
+
+/// Byte width of the compact count encoding for a maximum count `max`.
+fn count_width(max: u64) -> usize {
+    if max < 1 << 8 {
+        1
+    } else if max < 1 << 16 {
+        2
+    } else if max < 1 << 32 {
+        4
+    } else {
+        8
+    }
+}
+
+/// The counts behind a multiplicity vector, with their encoding width.
+///
+/// Each count is recovered from its field element by multiplying the
+/// Montgomery form by the *raw* inner `1` (not the field's one), which
+/// leaves the canonical residue in the inner limbs; the round trip
+/// through `F::from_with_cfg` is asserted, so a vector that is not made
+/// of `u64` counts cannot be silently mis-encoded.
+#[allow(clippy::arithmetic_side_effects)]
+fn multiplicity_counts<F>(mults: &[F]) -> (usize, Vec<u64>)
+where
+    F: InnerTransparentField + FromPrimitiveWithConfig,
+    F::Inner: ConstTranscribable,
+{
+    let inner_bytes = F::Inner::NUM_BYTES;
+    let take = inner_bytes.min(8);
+    let mut buf = vec![0u8; inner_bytes];
+    buf[0] = 1;
+    let raw_one = F::Inner::read_transcription_bytes_exact(&buf);
+    let counts: Vec<u64> = mults
+        .iter()
+        .map(|m| {
+            let mut canonical = m.clone();
+            canonical.mul_assign_by_inner(&raw_one);
+            canonical.inner().write_transcription_bytes_exact(&mut buf);
+            assert!(
+                buf[take..].iter().all(|&b| b == 0),
+                "multiplicity is not a u64 count"
+            );
+            let mut le = [0u8; 8];
+            le[..take].copy_from_slice(&buf[..take]);
+            let c = u64::from_le_bytes(le);
+            assert!(
+                F::from_with_cfg(c, m.cfg()) == *m,
+                "multiplicity count round trip failed"
+            );
+            c
+        })
+        .collect();
+    let max = counts.iter().copied().max().unwrap_or(0);
+    (count_width(max), counts)
+}
+
+/// Bytes of one compactly encoded multiplicity vector:
+/// `u32 N || u8 width || N × width`.
+fn counts_num_bytes(width: usize, n: usize) -> usize {
+    add!(add!(u32::NUM_BYTES, u8::NUM_BYTES), mul!(n, width))
+}
+
+#[allow(clippy::arithmetic_side_effects)]
+fn write_counts<'a>(buf: &'a mut [u8], width: usize, counts: &[u64]) -> &'a mut [u8] {
+    let mut buf = write_u32_prefix(buf, counts.len());
+    buf[0] = u8::try_from(width).expect("width is 1, 2, 4 or 8");
+    buf = &mut buf[1..];
+    let (head, rest) = buf.split_at_mut(mul!(counts.len(), width));
+    for (dst, c) in head.chunks_exact_mut(width).zip(counts) {
+        dst.copy_from_slice(&c.to_le_bytes()[..width]);
+    }
+    rest
+}
+
+/// Reads one compactly encoded multiplicity vector back as field elements
+/// (`F::from_with_cfg(count)`, memoised: counts repeat heavily).
+#[allow(clippy::arithmetic_side_effects)]
+fn read_counts<'a, F>(bytes: &'a [u8], cfg: &F::Config) -> (Vec<F>, &'a [u8])
+where
+    F: PrimeField + FromPrimitiveWithConfig,
+{
+    let (n, bytes) = read_u32_prefix(bytes);
+    let width = usize::from(bytes[0]);
+    assert!(
+        matches!(width, 1 | 2 | 4 | 8),
+        "invalid multiplicity count width {width}"
+    );
+    let bytes = &bytes[1..];
+    let (head, rest) = bytes.split_at(mul!(n, width));
+    let mut memo: Vec<Option<F>> = if width <= 2 {
+        vec![None; 1usize << (8 * width)]
+    } else {
+        Vec::new()
+    };
+    let out = head
+        .chunks_exact(width)
+        .map(|chunk| {
+            let mut le = [0u8; 8];
+            le[..width].copy_from_slice(chunk);
+            let c = u64::from_le_bytes(le);
+            match usize::try_from(c).ok().and_then(|i| memo.get_mut(i)) {
+                Some(slot) => slot.get_or_insert_with(|| F::from_with_cfg(c, cfg)).clone(),
+                None => F::from_with_cfg(c, cfg),
+            }
+        })
+        .collect();
+    (out, rest)
 }
 
 // ---------- GkrLayerProof ----------
@@ -661,7 +787,7 @@ fn read_meta(bytes: &[u8]) -> (GkrLogupGroupMeta, &[u8]) {
 // ---------- GkrLogupGroupProof ----------
 
 #[allow(clippy::arithmetic_side_effects)]
-fn group_num_bytes<F: PrimeField>(g: &GkrLogupGroupProof<F>) -> usize
+fn group_num_bytes<F: InnerTransparentField + FromPrimitiveWithConfig>(g: &GkrLogupGroupProof<F>) -> usize
 where
     F::Inner: ConstTranscribable,
     F::Modulus: ConstTranscribable,
@@ -678,18 +804,21 @@ where
             )
         );
     }
-    // aggregated_multiplicities: u32 L, then per-lookup u32 N, then N × F::Inner.
+    // aggregated_multiplicities: u32 L, then per lookup the compact counts.
     let mut mults_bytes = u32::NUM_BYTES;
     for per_lookup in &g.aggregated_multiplicities {
-        mults_bytes = add!(
-            mults_bytes,
-            add!(u32::NUM_BYTES, mul!(per_lookup.len(), F::Inner::NUM_BYTES))
-        );
+        let (width, counts) = multiplicity_counts(per_lookup);
+        mults_bytes = add!(mults_bytes, counts_num_bytes(width, counts.len()));
     }
     let bin_lifts_v = DynamicPolyVecF::reinterpret(&g.bin_lifts_at_r_inner);
     let bin_lifts_bytes = add!(
         DynamicPolyVecF::<F>::LENGTH_NUM_BYTES,
         bin_lifts_v.get_num_bytes()
+    );
+    // int_evals_at_r_inner: u32 n, then n × F::Inner.
+    let int_evals_bytes = add!(
+        u32::NUM_BYTES,
+        mul!(g.int_evals_at_r_inner.len(), F::Inner::NUM_BYTES)
     );
     add!(
         chunk_lifts_bytes,
@@ -697,14 +826,17 @@ where
             mults_bytes,
             add!(
                 batched_fraction_num_bytes(&g.witness_gkr),
-                add!(fraction_num_bytes(&g.table_gkr), bin_lifts_bytes)
+                add!(
+                    fraction_num_bytes(&g.table_gkr),
+                    add!(bin_lifts_bytes, int_evals_bytes)
+                )
             )
         )
     )
 }
 
 #[allow(clippy::arithmetic_side_effects)]
-fn write_group<'a, F: PrimeField>(
+fn write_group<'a, F: InnerTransparentField + FromPrimitiveWithConfig>(
     buf: &'a mut [u8],
     g: &GkrLogupGroupProof<F>,
 ) -> &'a mut [u8]
@@ -720,17 +852,19 @@ where
     }
     buf = write_u32_prefix(buf, g.aggregated_multiplicities.len());
     for mults in &g.aggregated_multiplicities {
-        buf = write_u32_prefix(buf, mults.len());
-        buf = write_f_inner_slice(buf, mults);
+        let (width, counts) = multiplicity_counts(mults);
+        buf = write_counts(buf, width, &counts);
     }
     buf = write_batched_fraction(buf, &g.witness_gkr);
     buf = write_fraction(buf, &g.table_gkr);
-    DynamicPolyVecF::reinterpret(&g.bin_lifts_at_r_inner)
-        .write_transcription_bytes_subset(buf)
+    buf = DynamicPolyVecF::reinterpret(&g.bin_lifts_at_r_inner)
+        .write_transcription_bytes_subset(buf);
+    buf = write_u32_prefix(buf, g.int_evals_at_r_inner.len());
+    write_f_inner_slice(buf, &g.int_evals_at_r_inner)
 }
 
 #[allow(clippy::arithmetic_side_effects)]
-fn read_group<'a, F: PrimeField>(
+fn read_group<'a, F: InnerTransparentField + FromPrimitiveWithConfig>(
     bytes: &'a [u8],
     cfg: &F::Config,
 ) -> (GkrLogupGroupProof<F>, &'a [u8])
@@ -757,15 +891,15 @@ where
     let (l2, mut bytes) = read_u32_prefix(bytes);
     let mut aggregated_multiplicities = Vec::with_capacity(l2);
     for _ in 0..l2 {
-        let (n, rest) = read_u32_prefix(bytes);
-        bytes = rest;
-        let (mults, rest) = read_f_inner_slice::<F>(bytes, n, cfg);
+        let (mults, rest) = read_counts::<F>(bytes, cfg);
         bytes = rest;
         aggregated_multiplicities.push(mults);
     }
     let (witness_gkr, bytes) = read_batched_fraction::<F>(bytes, cfg);
     let (table_gkr, bytes) = read_fraction::<F>(bytes, cfg);
     let (bin_lifts_v, bytes) = DynamicPolyVecF::<F>::read_transcription_bytes_subset(bytes);
+    let (n_int, bytes) = read_u32_prefix(bytes);
+    let (int_evals_at_r_inner, bytes) = read_f_inner_slice::<F>(bytes, n_int, cfg);
     (
         GkrLogupGroupProof {
             chunk_lifts,
@@ -773,6 +907,7 @@ where
             witness_gkr,
             table_gkr,
             bin_lifts_at_r_inner: bin_lifts_v.0,
+            int_evals_at_r_inner,
         },
         bytes,
     )
@@ -790,7 +925,7 @@ where
 
 impl<F> GenTranscribable for GkrLogupLookupProof<F>
 where
-    F: PrimeField,
+    F: InnerTransparentField + FromPrimitiveWithConfig,
     F::Inner: ConstTranscribable,
     F::Modulus: ConstTranscribable,
 {
@@ -864,7 +999,7 @@ where
 
 impl<F> Transcribable for GkrLogupLookupProof<F>
 where
-    F: PrimeField,
+    F: InnerTransparentField + FromPrimitiveWithConfig,
     F::Inner: ConstTranscribable,
     F::Modulus: ConstTranscribable,
 {
@@ -894,7 +1029,7 @@ where
 #[allow(clippy::arithmetic_side_effects)]
 pub fn dump_size_breakdown<F>(proof: &GkrLogupLookupProof<F>) -> String
 where
-    F: PrimeField,
+    F: InnerTransparentField + FromPrimitiveWithConfig,
     F::Inner: ConstTranscribable,
     F::Modulus: ConstTranscribable,
 {
@@ -956,17 +1091,15 @@ where
             meta.num_lookups, meta.num_chunks, chunk_lifts_bytes
         );
 
-        // aggregated_multiplicities
+        // aggregated_multiplicities (compact counts)
         let mut mults_bytes = u32::NUM_BYTES;
         for per_lookup in &g.aggregated_multiplicities {
-            mults_bytes = add!(
-                mults_bytes,
-                add!(u32::NUM_BYTES, mul!(per_lookup.len(), F::Inner::NUM_BYTES))
-            );
+            let (width, counts) = multiplicity_counts(per_lookup);
+            mults_bytes = add!(mults_bytes, counts_num_bytes(width, counts.len()));
         }
         let _ = writeln!(
             s,
-            "    aggregated_multiplicities (L × table_len):  {}",
+            "    aggregated_multiplicities (L × table_len, compact counts): {}",
             mults_bytes
         );
 
@@ -1019,6 +1152,15 @@ where
             "    bin_lifts_at_r_inner ({} polys × ≤D coeffs):{}",
             g.bin_lifts_at_r_inner.len(),
             bin_lifts_bytes
+        );
+        let _ = writeln!(
+            s,
+            "    int_evals_at_r_inner ({} scalars):            {}",
+            g.int_evals_at_r_inner.len(),
+            add!(
+                u32::NUM_BYTES,
+                mul!(g.int_evals_at_r_inner.len(), F::Inner::NUM_BYTES)
+            )
         );
 
         let group_total = group_num_bytes(g);

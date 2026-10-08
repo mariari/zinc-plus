@@ -12,6 +12,31 @@ use zinc_utils::{
     from_ref::FromRef, inner_product::InnerProduct, mul_by_scalar::MulByScalar, named::Named,
 };
 
+/// Number of Zip+ column openings (proximity spot checks) needed for
+/// `security_bits` bits of soundness at code rate `1 / inverse_rate`.
+///
+/// The IOPP's proximity parameter is the 1.5 Johnson bound
+/// `θ = 1 − ρ^{1/3}` (the radius up to which every linear code over `Q`
+/// has mutual correlated agreement, Zinc+ paper, MCA appendix), so a
+/// single opened column fails to expose a `θ`-far word with probability
+/// `1 − θ = ρ^{1/3}` and `t` openings give `t · log2(1/ρ) / 3` bits:
+///
+/// | rate | bits / opening | 100-bit | 114-bit | 128-bit |
+/// |------|----------------|---------|---------|---------|
+/// | 1/4  | 2/3            | 150     | 171     | 192     |
+/// | 1/8  | 1              | 100     | 114     | 128     |
+/// | 1/16 | 4/3            | 75      | 86      | 96      |
+///
+/// `inverse_rate` must be a power of two.
+pub const fn num_column_openings(inverse_rate: usize, security_bits: usize) -> usize {
+    assert!(
+        inverse_rate.is_power_of_two() && inverse_rate >= 2,
+        "inverse_rate must be a power of two >= 2"
+    );
+    let log2_inverse_rate = inverse_rate.trailing_zeros() as usize;
+    (3 * security_bits).div_ceil(log2_inverse_rate)
+}
+
 pub trait ZipTypes: Clone + Debug + Send + Sync {
     const NUM_COLUMN_OPENINGS: usize;
 
@@ -154,4 +179,24 @@ impl GenTranscribable for ZipPlusCommitment {
 
 impl ConstTranscribable for ZipPlusCommitment {
     const NUM_BYTES: usize = MtHash::NUM_BYTES + u64::NUM_BYTES;
+}
+
+#[cfg(test)]
+mod openings_tests {
+    use super::num_column_openings;
+
+    #[test]
+    fn repo_conventions_are_100_bit() {
+        assert_eq!(num_column_openings(4, 100), 150);
+        assert_eq!(num_column_openings(8, 100), 100);
+        assert_eq!(num_column_openings(16, 100), 75);
+    }
+
+    #[test]
+    fn higher_targets() {
+        assert_eq!(num_column_openings(8, 114), 114);
+        assert_eq!(num_column_openings(8, 128), 128);
+        assert_eq!(num_column_openings(4, 128), 192);
+        assert_eq!(num_column_openings(16, 114), 86);
+    }
 }

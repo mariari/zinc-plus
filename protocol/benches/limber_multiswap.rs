@@ -1,0 +1,1340 @@
+//! Limber (ePrint 2026/1635) Table 1 "Zinc+" row — the same statement on
+//! the current main-beta pipeline.
+//!
+//! Statement: MultiSwap (ePrint 2019/1494, k = 0 swaps) ≈ 6,209 integer
+//! constraints of the moduli-R1CS shape a·b = c + u·N over a 2048-bit
+//! modulus. Here encoded honestly: 4 integer witness columns of 2048-bit
+//! magnitude (Int<34>), one real modmul constraint per row.
+//!
+//! Methodology mirrors Limber §7: single-threaded unless the `parallel`
+//! feature is on; medians over N runs; prover time includes commitment
+//! (witness generation is timed separately and also reported added in);
+//! proof sizes raw + zstd-22.
+//!
+//! Three statements share the harness (env knobs, see `main`):
+//! - the 2048-bit int-cell mock (`WIDE8` / `WIDE16`, optionally `FOLD=1`):
+//!   real `a·b = c + u·N` witnesses in fat `Int<34>` cells, NO range
+//!   checks (a rational witness could satisfy it) — the shape Limber's
+//!   Table 1 row was reconstructed with;
+//! - `LIMB16=1`: the same statement over 16-bit limb columns
+//!   (`4 × 128` int columns per modmul, one modmul per row) with every limb
+//!   range-checked by the `Word { width: 16 }` GKR-LogUp lookup, so the
+//!   witness is provably integral — the sound, apples-to-apples row.
+//!
+//! The projecting prime is drawn from the Fiat–Shamir transcript
+//! (`FIXED_PROJECTING_PRIME = None`): 128-bit at the 100-bit target,
+//! 192-bit under `sec-114` / `sec-128`.
+
+#![allow(clippy::arithmetic_side_effects)]
+
+use crypto_bigint::NonZero;
+use crypto_primitives::{
+    ConstIntRing, ConstIntSemiring, FixedSemiring, PrimeField, crypto_bigint_int::Int,
+    crypto_bigint_uint::Uint,
+};
+use std::{fmt::Debug, hint::black_box, marker::PhantomData, ops::Neg, time::Instant};
+use zinc_poly::{
+    ConstCoeffBitWidth, Polynomial,
+    mle::DenseMultilinearExtension,
+    univariate::{
+        binary::{BinaryPoly, BinaryPolyInnerProduct},
+        dense::{DensePolyInnerProduct, DensePolynomial},
+    },
+};
+use zinc_primality::{MillerRabin, PrimalityTest};
+use zinc_protocol::{IntFoldedZincTypes4x, Proof, ZincPlusPiop, ZincTypes};
+use zinc_test_uair::GenerateRandomTrace;
+use zinc_transcript::traits::ConstTranscribable;
+use zinc_uair::{
+    ConstraintBuilder, LookupColumnSpec, LookupTableType, PublicColumnLayout, TotalColumnLayout,
+    TraceRow, Uair, UairSignature, UairTrace,
+    ideal::ImpossibleIdeal,
+    ideal_collector::IdealOrZero,
+};
+use zinc_utils::{
+    field::runtime_monty::Fp,
+    from_ref::FromRef,
+    inner_product::{InnerProduct, MBSInnerProduct, ScalarProduct},
+    mul_by_scalar::MulByScalar,
+    named::Named,
+};
+use zip_plus::{
+    code::{
+        LinearCode,
+        iprs::{IprsCode, IprsCodeNarrow, PnttConfigF65537},
+    },
+    pcs::structs::{ZipPlus, ZipTypes},
+    utils::eprint_proof_size,
+};
+
+const PERFORM_CHECKS: bool = if cfg!(feature = "unchecked") {
+    zinc_utils::UNCHECKED
+} else {
+    zinc_utils::CHECKED
+};
+
+/// Inverse rate, following the repo convention: default 4, `iprs-rate-1-8`
+/// switches to 8.
+const REP: usize = if cfg!(feature = "iprs-rate-1-16") {
+    16
+} else if cfg!(feature = "iprs-rate-1-8") {
+    8
+} else {
+    4
+};
+
+/// Target security level (100 by default; `sec-114` / `sec-128` features).
+const SECURITY_BITS: usize = zinc_protocol::SECURITY_BITS;
+
+/// Openings for `SECURITY_BITS` at rate `1/REP` (150 / 100 / 75 at 100 bits
+/// for rates 1/4, 1/8, 1/16; see `zip_plus::pcs::structs::num_column_openings`).
+const NUM_COL_OPENINGS_FOR_REP: usize =
+    zip_plus::pcs::structs::num_column_openings(REP, SECURITY_BITS);
+
+//
+// Generic Zip/Zinc type scaffolding — copied from `protocol/benches/e2e.rs`
+// on this branch (same bounds), so the concrete instantiation below is the
+// only new part.
+//
+
+#[allow(clippy::type_complexity)]
+#[derive(Debug, Clone, Copy)]
+pub struct GenericBenchZipTypes<
+    Eval,
+    Cw,
+    Fmod,
+    PrimeTest,
+    Chal,
+    Pt,
+    CombR,
+    Comb,
+    EvalDotChal,
+    CombDotChal,
+    ArrCombRDotChal,
+>(
+    PhantomData<(
+        Eval,
+        Cw,
+        Fmod,
+        PrimeTest,
+        Chal,
+        Pt,
+        CombR,
+        Comb,
+        EvalDotChal,
+        CombDotChal,
+        ArrCombRDotChal,
+    )>,
+);
+
+impl<Eval, Cw, Fmod, PrimeTest, Chal, Pt, CombR, Comb, EvalDotChal, CombDotChal, ArrCombRDotChal>
+    ZipTypes
+    for GenericBenchZipTypes<
+        Eval,
+        Cw,
+        Fmod,
+        PrimeTest,
+        Chal,
+        Pt,
+        CombR,
+        Comb,
+        EvalDotChal,
+        CombDotChal,
+        ArrCombRDotChal,
+    >
+where
+    Eval: ConstCoeffBitWidth + Default + Named + Clone + Debug + Send + Sync,
+    Cw: FixedSemiring + ConstCoeffBitWidth + ConstTranscribable + FromRef<Eval> + Named + Copy,
+    Fmod: ConstIntSemiring + ConstTranscribable + Named,
+    PrimeTest: PrimalityTest<Fmod> + Send + Sync,
+    Chal: ConstIntRing + ConstTranscribable + Named,
+    Pt: ConstIntRing,
+    CombR: ConstIntRing
+        + Neg<Output = CombR>
+        + ConstTranscribable
+        + FromRef<CombR>
+        + for<'a> MulByScalar<&'a Chal>,
+    Comb: FixedSemiring + Polynomial<CombR> + FromRef<Eval> + FromRef<Cw> + Named,
+    EvalDotChal: InnerProduct<Eval, Chal, CombR> + Clone + Debug + Send + Sync,
+    CombDotChal: InnerProduct<Comb, Chal, CombR> + Clone + Debug + Send + Sync,
+    ArrCombRDotChal: InnerProduct<[CombR], Chal, CombR> + Clone + Debug + Send + Sync,
+{
+    const NUM_COLUMN_OPENINGS: usize = NUM_COL_OPENINGS_FOR_REP;
+    type Eval = Eval;
+    type Cw = Cw;
+    type Fmod = Fmod;
+    type PrimeTest = PrimeTest;
+    type Chal = Chal;
+    type Pt = Pt;
+    type CombR = CombR;
+    type Comb = Comb;
+    type EvalDotChal = EvalDotChal;
+    type CombDotChal = CombDotChal;
+    type ArrCombRDotChal = ArrCombRDotChal;
+}
+
+/// Marker selecting the int lane's code: the plain IPRS code, or the
+/// narrow-stage variant for 16-bit cells.
+trait IntLane<Zt: ZipTypes> {
+    type Code: LinearCode<Zt> + BenchCode;
+}
+#[derive(Clone, Debug)]
+struct PlainIprs;
+impl<Zt: ZipTypes> IntLane<Zt> for PlainIprs
+where
+    IprsCode<Zt, PnttConfigF65537, REP, PERFORM_CHECKS>: LinearCode<Zt>,
+{
+    type Code = IprsCode<Zt, PnttConfigF65537, REP, PERFORM_CHECKS>;
+}
+#[derive(Clone, Debug)]
+struct NarrowIprs;
+impl<Zt: ZipTypes> IntLane<Zt> for NarrowIprs
+where
+    IprsCodeNarrow<Zt, PnttConfigF65537, REP, PERFORM_CHECKS>: LinearCode<Zt>,
+{
+    type Code = IprsCodeNarrow<Zt, PnttConfigF65537, REP, PERFORM_CHECKS>;
+}
+
+#[derive(Clone, Debug)]
+struct GenericBenchZincTypes<
+    Int,
+    CwR,
+    Chal,
+    Pt,
+    BinaryCombR,
+    CombR,
+    IntCombR,
+    Fmod,
+    PrimeTest,
+    const D: usize,
+    IntCode = PlainIprs,
+>(
+    PhantomData<(
+        Int,
+        CwR,
+        Chal,
+        Pt,
+        BinaryCombR,
+        CombR,
+        IntCombR,
+        Fmod,
+        PrimeTest,
+        IntCode,
+    )>,
+);
+
+impl<Int, CwR, Chal, Pt, BinaryCombR, CombR, IntCombR, Fmod, PrimeTest, const D: usize, IntCode>
+    ZincTypes<D>
+    for GenericBenchZincTypes<
+        Int,
+        CwR,
+        Chal,
+        Pt,
+        BinaryCombR,
+        CombR,
+        IntCombR,
+        Fmod,
+        PrimeTest,
+        D,
+        IntCode,
+    >
+where
+    IntCode: IntLane<
+            GenericBenchZipTypes<
+                Int,
+                CwR,
+                Fmod,
+                PrimeTest,
+                Chal,
+                Pt,
+                IntCombR,
+                IntCombR,
+                ScalarProduct,
+                ScalarProduct,
+                MBSInnerProduct,
+            >,
+        > + Clone
+        + Debug
+        + Send
+        + Sync
+        + 'static,
+    Int: ConstIntSemiring
+        + for<'a> MulByScalar<&'a i64, CwR>
+        + Named
+        + ConstCoeffBitWidth
+        + ConstTranscribable
+        + Default
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    CwR: FixedSemiring
+        + for<'a> MulByScalar<&'a i64>
+        + ConstCoeffBitWidth
+        + ConstTranscribable
+        + Named
+        + FromRef<Int>
+        + FromRef<CwR>
+        + Copy,
+    Chal: ConstIntRing + ConstTranscribable + Named,
+    Pt: ConstIntRing,
+    BinaryCombR: ConstIntRing
+        + Polynomial<BinaryCombR>
+        + Neg<Output = BinaryCombR>
+        + for<'a> MulByScalar<&'a i64>
+        + for<'a> MulByScalar<&'a Chal>
+        + ConstTranscribable
+        + Named
+        + FromRef<i64>
+        + FromRef<Int>
+        + FromRef<CwR>
+        + FromRef<Chal>
+        + FromRef<BinaryCombR>,
+    CombR: ConstIntRing
+        + Polynomial<CombR>
+        + Neg<Output = CombR>
+        + for<'a> MulByScalar<&'a i64>
+        + for<'a> MulByScalar<&'a Chal>
+        + ConstTranscribable
+        + Named
+        + FromRef<i64>
+        + FromRef<Int>
+        + FromRef<CwR>
+        + FromRef<Chal>
+        + FromRef<CombR>,
+    IntCombR: ConstIntRing
+        + Polynomial<IntCombR>
+        + Neg<Output = IntCombR>
+        + for<'a> MulByScalar<&'a i64>
+        + for<'a> MulByScalar<&'a Chal>
+        + ConstTranscribable
+        + Named
+        + FromRef<i64>
+        + FromRef<Int>
+        + FromRef<CwR>
+        + FromRef<Chal>
+        + FromRef<IntCombR>,
+    Fmod: ConstIntSemiring + ConstTranscribable + Named,
+    PrimeTest: PrimalityTest<Fmod> + Debug + Send + Sync,
+{
+    type Int = Int;
+    type Chal = Chal;
+    type Pt = Pt;
+    type Fmod = Fmod;
+    type PrimeTest = PrimeTest;
+
+    type BinaryZt = GenericBenchZipTypes<
+        BinaryPoly<D>,
+        DensePolynomial<i64, D>,
+        Fmod,
+        PrimeTest,
+        Chal,
+        Pt,
+        BinaryCombR,
+        DensePolynomial<BinaryCombR, D>,
+        BinaryPolyInnerProduct<Chal, D>,
+        DensePolyInnerProduct<BinaryCombR, Chal, BinaryCombR, MBSInnerProduct, D>,
+        MBSInnerProduct,
+    >;
+    type ArbitraryZt = GenericBenchZipTypes<
+        DensePolynomial<Int, D>,
+        DensePolynomial<CwR, D>,
+        Fmod,
+        PrimeTest,
+        Chal,
+        Pt,
+        CombR,
+        DensePolynomial<CombR, D>,
+        DensePolyInnerProduct<Int, Chal, CombR, MBSInnerProduct, D>,
+        DensePolyInnerProduct<CombR, Chal, CombR, MBSInnerProduct, D>,
+        MBSInnerProduct,
+    >;
+    type IntZt = GenericBenchZipTypes<
+        Int,
+        CwR,
+        Fmod,
+        PrimeTest,
+        Chal,
+        Pt,
+        IntCombR,
+        IntCombR,
+        ScalarProduct,
+        ScalarProduct,
+        MBSInnerProduct,
+    >;
+
+    type BinaryLc = IprsCode<Self::BinaryZt, PnttConfigF65537, REP, PERFORM_CHECKS>;
+    type ArbitraryLc = IprsCode<Self::ArbitraryZt, PnttConfigF65537, REP, PERFORM_CHECKS>;
+    type IntLc = <IntCode as IntLane<Self::IntZt>>::Code;
+}
+
+/// How the harness builds a lane's linear code for a given row length.
+trait BenchCode: Sized {
+    fn bench_new(row_len: usize) -> Self;
+}
+
+impl<Zt: ZipTypes> BenchCode for IprsCode<Zt, PnttConfigF65537, REP, PERFORM_CHECKS> {
+    fn bench_new(row_len: usize) -> Self {
+        IprsCode::new_with_optimal_depth(row_len).expect("IPRS params")
+    }
+}
+
+/// The limb lane's code: the base layer and the first radix-8 stage run
+/// over `i64`. With 16-bit cells and the depth-3 code at row length 8192
+/// (`base_len = 16`) the base layer stays below `2^35` and the first stage
+/// below `2^53`, so one narrow stage is exact (CHECKED-validated at
+/// nvars = 13); the second stage would reach `2^71`.
+impl<Zt: ZipTypes> BenchCode for IprsCodeNarrow<Zt, PnttConfigF65537, REP, PERFORM_CHECKS> {
+    fn bench_new(row_len: usize) -> Self {
+        IprsCodeNarrow::new(IprsCode::new_with_optimal_depth(row_len).expect("IPRS params"), 1)
+            .expect("narrow IPRS params")
+    }
+}
+
+//
+// Concrete instantiation: 2048-bit integer witness cells.
+//
+
+const DEGREE_PLUS_ONE: usize = 32;
+
+/// Width of the transcript-drawn projecting prime, in 64-bit limbs. Every
+/// Fiat–Shamir soundness term is `O(size / prime)`: the fingerprinting
+/// (random-prime) step spends `≈ (bits of the largest constraint residue,
+/// ~2^13 here) / prime`, and the range-check LogUp spends
+/// `≈ (#looked-up cells + table size, ~2^22) / prime`, so 128 bits leaves
+/// > 100 bits at the default target and 192 bits is used above it.
+const FIELD_LIMBS: usize = if SECURITY_BITS > 100 { 3 } else { 2 };
+
+zinc_utils::define_modulus!(LimberBenchSlot, FIELD_LIMBS);
+type F = Fp<LimberBenchSlot, FIELD_LIMBS>;
+
+const BIG: usize = 34; // Eval limbs: 2176-bit type for 2048-bit values
+const BIG_CW: usize = 38; // codeword limbs
+const BIG_M: usize = 44; // combination-ring limbs
+
+type RsaInt = Int<BIG>;
+
+type RsaZincTypes = GenericBenchZincTypes<
+    /* Int         = */ RsaInt,
+    /* CwR         = */ Int<BIG_CW>,
+    /* Chal        = */ i128,
+    /* Pt          = */ i128,
+    /* BinaryCombR = */ Int<5>,
+    /* CombR       = */ Int<BIG_M>,
+    /* IntCombR    = */ Int<BIG_M>,
+    /* Fmod        = */ Uint<FIELD_LIMBS>,
+    MillerRabin,
+    DEGREE_PLUS_ONE,
+>;
+
+//
+// The UAIR: 4 int columns (a, b, c, u); a·b − c − u·N = 0 over Z per row.
+//
+
+/// Fixed 2048-bit modulus N = 2^2048 − 59 (stands in for the RSA-2048
+/// modulus; the factorization is irrelevant to proving cost).
+fn modulus_raw() -> crypto_bigint::Uint<32> {
+    let hex = format!("{}C5", "F".repeat(510));
+    crypto_bigint::Uint::<32>::from_be_hex(&hex)
+}
+
+/// Reinterpret a non-negative raw Uint (top bits clear) as the wrapper Int.
+fn int34(v: &crypto_bigint::Uint<64>) -> RsaInt {
+    *Uint::<BIG>::new(v.resize::<BIG>()).as_int()
+}
+
+fn n_scalar() -> DensePolynomial<RsaInt, 32> {
+    let mut coeffs = [<RsaInt as num_traits::ConstZero>::ZERO; 32];
+    coeffs[0] = int34(&modulus_raw().resize::<64>());
+    DensePolynomial::new(coeffs)
+}
+
+#[derive(Clone, Debug)]
+pub struct RsaModMulUair;
+
+impl Uair for RsaModMulUair {
+    type Ideal = ImpossibleIdeal;
+    type Scalar = DensePolynomial<RsaInt, 32>;
+
+    fn signature() -> UairSignature {
+        let total = TotalColumnLayout::new(0, 0, 4);
+        UairSignature::new(total, PublicColumnLayout::default(), vec![], vec![], vec![])
+    }
+
+    fn constrain_general<B, FromR, MulByScalar, IFromR>(
+        b: &mut B,
+        up: TraceRow<B::Expr>,
+        _down: TraceRow<B::Expr>,
+        _from_ref: FromR,
+        mbs: MulByScalar,
+        _ideal_from_ref: IFromR,
+    ) where
+        B: ConstraintBuilder,
+        FromR: Fn(&Self::Scalar) -> B::Expr,
+        MulByScalar: Fn(&B::Expr, &Self::Scalar) -> Option<B::Expr>,
+        IFromR: Fn(&Self::Ideal) -> B::Ideal,
+    {
+        let n = n_scalar();
+        // a·b − c − u·N = 0 over Z.
+        let ab = up.int[0].clone() * &up.int[1];
+        let un = mbs(&up.int[3], &n).expect("u·N overflow");
+        b.assert_zero(ab - &up.int[2] - &un);
+    }
+}
+
+impl GenerateRandomTrace<DEGREE_PLUS_ONE> for RsaModMulUair {
+    type PolyCoeff = RsaInt;
+    type Int = RsaInt;
+
+    fn generate_random_trace<Rng: rand::RngCore + ?Sized>(
+        num_vars: usize,
+        rng: &mut Rng,
+    ) -> UairTrace<'static, RsaInt, RsaInt, DEGREE_PLUS_ONE> {
+        let len = 1usize << num_vars;
+        let n32 = modulus_raw();
+        let nz32: NonZero<crypto_bigint::Uint<32>> =
+            Option::from(NonZero::new(n32)).expect("N != 0");
+        let n64 = n32.resize::<64>();
+        let nz64: NonZero<crypto_bigint::Uint<64>> =
+            Option::from(NonZero::new(n64)).expect("N != 0");
+
+        let mut cols: [Vec<RsaInt>; 4] = core::array::from_fn(|_| Vec::with_capacity(len));
+
+        for _ in 0..len {
+            let mut rand32 = |rng: &mut Rng| -> crypto_bigint::Uint<32> {
+                crypto_bigint::Uint::<32>::from_words(core::array::from_fn(|_| rng.next_u64()))
+            };
+            let a = rand32(rng).div_rem(&nz32).1;
+            let b = rand32(rng).div_rem(&nz32).1;
+            let a64 = a.resize::<64>();
+            let b64 = b.resize::<64>();
+            let (lo, hi) = a64.widening_mul(&b64);
+            debug_assert_eq!(hi, crypto_bigint::Uint::<64>::ZERO);
+            let (u, c) = lo.div_rem(&nz64);
+
+            cols[0].push(int34(&a64));
+            cols[1].push(int34(&b64));
+            cols[2].push(int34(&c.resize::<64>()));
+            cols[3].push(int34(&u));
+        }
+
+        UairTrace {
+            int: cols
+                .into_iter()
+                .map(|v| v.into_iter().collect::<DenseMultilinearExtension<_>>())
+                .collect::<Vec<_>>()
+                .into(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Wide variant: 8 int columns = 2 modmul constraints per row, so 4096 rows
+/// carry 8192 constraint slots (>= 6,209 like Limber's circuit).
+#[derive(Clone, Debug)]
+pub struct RsaModMulWideUair;
+
+impl Uair for RsaModMulWideUair {
+    type Ideal = ImpossibleIdeal;
+    type Scalar = DensePolynomial<RsaInt, 32>;
+
+    fn signature() -> UairSignature {
+        let total = TotalColumnLayout::new(0, 0, 8);
+        UairSignature::new(total, PublicColumnLayout::default(), vec![], vec![], vec![])
+    }
+
+    fn constrain_general<B, FromR, MulByScalar, IFromR>(
+        b: &mut B,
+        up: TraceRow<B::Expr>,
+        _down: TraceRow<B::Expr>,
+        _from_ref: FromR,
+        mbs: MulByScalar,
+        _ideal_from_ref: IFromR,
+    ) where
+        B: ConstraintBuilder,
+        FromR: Fn(&Self::Scalar) -> B::Expr,
+        MulByScalar: Fn(&B::Expr, &Self::Scalar) -> Option<B::Expr>,
+        IFromR: Fn(&Self::Ideal) -> B::Ideal,
+    {
+        let n = n_scalar();
+        for k in [0usize, 4] {
+            let ab = up.int[k].clone() * &up.int[k + 1];
+            let un = mbs(&up.int[k + 3], &n).expect("u·N overflow");
+            b.assert_zero(ab - &up.int[k + 2] - &un);
+        }
+    }
+}
+
+impl GenerateRandomTrace<DEGREE_PLUS_ONE> for RsaModMulWideUair {
+    type PolyCoeff = RsaInt;
+    type Int = RsaInt;
+
+    fn generate_random_trace<Rng: rand::RngCore + ?Sized>(
+        num_vars: usize,
+        rng: &mut Rng,
+    ) -> UairTrace<'static, RsaInt, RsaInt, DEGREE_PLUS_ONE> {
+        let len = 1usize << num_vars;
+        let n32 = modulus_raw();
+        let nz32: NonZero<crypto_bigint::Uint<32>> =
+            Option::from(NonZero::new(n32)).expect("N != 0");
+        let n64 = n32.resize::<64>();
+        let nz64: NonZero<crypto_bigint::Uint<64>> =
+            Option::from(NonZero::new(n64)).expect("N != 0");
+
+        let mut cols: [Vec<RsaInt>; 8] = core::array::from_fn(|_| Vec::with_capacity(len));
+
+        for _ in 0..len {
+            for k in [0usize, 4] {
+                let mut rand32 = |rng: &mut Rng| -> crypto_bigint::Uint<32> {
+                    crypto_bigint::Uint::<32>::from_words(core::array::from_fn(|_| {
+                        rng.next_u64()
+                    }))
+                };
+                let a = rand32(rng).div_rem(&nz32).1;
+                let b = rand32(rng).div_rem(&nz32).1;
+                let a64 = a.resize::<64>();
+                let b64 = b.resize::<64>();
+                let (lo, _hi) = a64.widening_mul(&b64);
+                let (u, c) = lo.div_rem(&nz64);
+
+                cols[k].push(int34(&a64));
+                cols[k + 1].push(int34(&b64));
+                cols[k + 2].push(int34(&c.resize::<64>()));
+                cols[k + 3].push(int34(&u));
+            }
+        }
+
+        UairTrace {
+            int: cols
+                .into_iter()
+                .map(|v| v.into_iter().collect::<DenseMultilinearExtension<_>>())
+                .collect::<Vec<_>>()
+                .into(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Wide-16 variant: 16 int columns = 4 modmul constraints per row, so
+/// 2048 rows (nvars = 11) carry 8192 constraint slots — the same
+/// statement as wide8 @ nvars = 12 in a shape whose folded-4× row
+/// length (4·2048 = 8192) still fits the F65537 NTT cap at rate 1/8.
+#[derive(Clone, Debug)]
+pub struct RsaModMulWide16Uair;
+
+impl Uair for RsaModMulWide16Uair {
+    type Ideal = ImpossibleIdeal;
+    type Scalar = DensePolynomial<RsaInt, 32>;
+
+    fn signature() -> UairSignature {
+        let total = TotalColumnLayout::new(0, 0, 16);
+        UairSignature::new(total, PublicColumnLayout::default(), vec![], vec![], vec![])
+    }
+
+    fn constrain_general<B, FromR, MulByScalar, IFromR>(
+        b: &mut B,
+        up: TraceRow<B::Expr>,
+        _down: TraceRow<B::Expr>,
+        _from_ref: FromR,
+        mbs: MulByScalar,
+        _ideal_from_ref: IFromR,
+    ) where
+        B: ConstraintBuilder,
+        FromR: Fn(&Self::Scalar) -> B::Expr,
+        MulByScalar: Fn(&B::Expr, &Self::Scalar) -> Option<B::Expr>,
+        IFromR: Fn(&Self::Ideal) -> B::Ideal,
+    {
+        let n = n_scalar();
+        for k in [0usize, 4, 8, 12] {
+            let ab = up.int[k].clone() * &up.int[k + 1];
+            let un = mbs(&up.int[k + 3], &n).expect("u·N overflow");
+            b.assert_zero(ab - &up.int[k + 2] - &un);
+        }
+    }
+}
+
+impl GenerateRandomTrace<DEGREE_PLUS_ONE> for RsaModMulWide16Uair {
+    type PolyCoeff = RsaInt;
+    type Int = RsaInt;
+
+    fn generate_random_trace<Rng: rand::RngCore + ?Sized>(
+        num_vars: usize,
+        rng: &mut Rng,
+    ) -> UairTrace<'static, RsaInt, RsaInt, DEGREE_PLUS_ONE> {
+        let len = 1usize << num_vars;
+        let n32 = modulus_raw();
+        let nz32: NonZero<crypto_bigint::Uint<32>> =
+            Option::from(NonZero::new(n32)).expect("N != 0");
+        let n64 = n32.resize::<64>();
+        let nz64: NonZero<crypto_bigint::Uint<64>> =
+            Option::from(NonZero::new(n64)).expect("N != 0");
+
+        let mut cols: [Vec<RsaInt>; 16] = core::array::from_fn(|_| Vec::with_capacity(len));
+
+        for _ in 0..len {
+            for k in [0usize, 4, 8, 12] {
+                let mut rand32 = |rng: &mut Rng| -> crypto_bigint::Uint<32> {
+                    crypto_bigint::Uint::<32>::from_words(core::array::from_fn(|_| {
+                        rng.next_u64()
+                    }))
+                };
+                let a = rand32(rng).div_rem(&nz32).1;
+                let b = rand32(rng).div_rem(&nz32).1;
+                let a64 = a.resize::<64>();
+                let b64 = b.resize::<64>();
+                let (lo, _hi) = a64.widening_mul(&b64);
+                let (u, c) = lo.div_rem(&nz64);
+
+                cols[k].push(int34(&a64));
+                cols[k + 1].push(int34(&b64));
+                cols[k + 2].push(int34(&c.resize::<64>()));
+                cols[k + 3].push(int34(&u));
+            }
+        }
+
+        UairTrace {
+            int: cols
+                .into_iter()
+                .map(|v| v.into_iter().collect::<DenseMultilinearExtension<_>>())
+                .collect::<Vec<_>>()
+                .into(),
+            ..Default::default()
+        }
+    }
+}
+
+//
+// Limb statement: 16-bit limb columns + Word(16) range-check lookups.
+//
+// a·b = c + u·N with a, b, c, u each given as 128 little-endian 16-bit limbs
+// in their own int columns (512 columns, one modmul per row). Every limb
+// column carries a `Word { width: 16 }` lookup, so each cell is a proven
+// integer in [0, 2^16) and hence each value a proven integer in
+// [0, 2^2048) — the witness is integral, unlike the fat-cell mock above.
+// The values are recombined by Horner inside the constraint, so the only
+// scalars are 2^16 and the 16-bit limbs of N.
+//
+
+const LIMB_BITS: u32 = 16;
+const LIMBS_PER_VALUE: usize = 2048 / LIMB_BITS as usize; // 128
+const LIMB_COLS: usize = 4 * LIMBS_PER_VALUE; // a | b | c | u
+/// Combination-ring limbs. Worst-case bound: a combined-row entry is
+/// `Σ_j alpha_j · v_j` over 512 columns with 128-bit alphas and 16-bit
+/// limbs, `< 2^(128+16+9) = 2^153`; the verifier's `encode_wide` of it
+/// grows by the encoder's factor (`16 · 2^15` in the base layer, then
+/// `< 2^18` per radix-8 stage, three stages: `< 2^73`), and the opened
+/// columns' alpha-combination is `512 · 2^128 · 2^89 = 2^226`. Both stay
+/// below the 255 signed bits of `Int<4>` (CHECKED-validated at nvars = 13).
+const LIMB_M: usize = 4;
+
+/// One native 64-bit cell per 16-bit limb (sign headroom included) and
+/// native 128-bit codeword entries: the encoder grows 16-bit limbs by
+/// < 112 bits (CHECKED-validated at nvars = 13). Native `i64` / `i128`
+/// rather than `Int<1>` / `Int<2>`: same widths, but the IPRS butterflies
+/// then run on machine integers instead of crypto-bigint limb loops.
+type LimbInt = i64;
+type LimbCw = i128;
+
+type RsaLimbZincTypes = GenericBenchZincTypes<
+    /* Int         = */ LimbInt,
+    /* CwR         = */ LimbCw,
+    /* Chal        = */ i128,
+    /* Pt          = */ i128,
+    /* BinaryCombR = */ Int<5>,
+    /* CombR       = */ Int<LIMB_M>,
+    /* IntCombR    = */ Int<LIMB_M>,
+    /* Fmod        = */ Uint<FIELD_LIMBS>,
+    MillerRabin,
+    DEGREE_PLUS_ONE,
+    /* int code    = */ NarrowIprs,
+>;
+
+fn limb_int(v: u64) -> LimbInt {
+    i64::try_from(v).expect("16-bit limb fits an i64")
+}
+
+/// Little-endian 16-bit limbs of a 4096-bit-capable value (only the low
+/// 2048 bits are used).
+fn limbs16(v: &crypto_bigint::Uint<64>) -> [u64; LIMBS_PER_VALUE] {
+    let words = v.as_words();
+    core::array::from_fn(|i| (words[i / 4] >> (16 * (i % 4))) & 0xFFFF)
+}
+
+#[derive(Clone, Debug)]
+pub struct RsaModMulLimbUair;
+
+impl Uair for RsaModMulLimbUair {
+    type Ideal = ImpossibleIdeal;
+    /// Degree-0 scalars: the radix 2^16 and N itself (one 2048-bit
+    /// scalar, so `u·N` is a single scalar multiplication and the
+    /// constraint uses two distinct scalars in total — both hit the
+    /// per-call projection cache instead of a hash lookup per use).
+    type Scalar = DensePolynomial<RsaInt, 1>;
+
+    fn signature() -> UairSignature {
+        let total = TotalColumnLayout::new(0, 0, LIMB_COLS);
+        let lookup_specs: Vec<LookupColumnSpec> = (0..LIMB_COLS)
+            .map(|i| LookupColumnSpec {
+                column_index: i,
+                table_type: LookupTableType::Word { width: LIMB_BITS as usize, chunk_width: None },
+            })
+            .collect();
+        UairSignature::new(total, PublicColumnLayout::default(), vec![], lookup_specs, vec![])
+    }
+
+    fn constrain_general<B, FromR, MulByScalar, IFromR>(
+        b: &mut B,
+        up: TraceRow<B::Expr>,
+        _down: TraceRow<B::Expr>,
+        _from_ref: FromR,
+        mbs: MulByScalar,
+        _ideal_from_ref: IFromR,
+    ) where
+        B: ConstraintBuilder,
+        FromR: Fn(&Self::Scalar) -> B::Expr,
+        MulByScalar: Fn(&B::Expr, &Self::Scalar) -> Option<B::Expr>,
+        IFromR: Fn(&Self::Ideal) -> B::Ideal,
+    {
+        let radix = DensePolynomial::<RsaInt, 1>::new([RsaInt::from(1i64 << LIMB_BITS)]);
+        // value = Σ_i 2^{16 i} · limb_i, Horner from the top limb down.
+        let value = |base: usize| -> B::Expr {
+            let mut acc = up.int[base + LIMBS_PER_VALUE - 1].clone();
+            for i in (0..LIMBS_PER_VALUE - 1).rev() {
+                acc = mbs(&acc, &radix).expect("radix mul") + &up.int[base + i];
+            }
+            acc
+        };
+        let a = value(0);
+        let bb = value(LIMBS_PER_VALUE);
+        let c = value(2 * LIMBS_PER_VALUE);
+        let u = value(3 * LIMBS_PER_VALUE);
+
+        // u·N with N as one scalar.
+        let n = DensePolynomial::<RsaInt, 1>::new([int34(&modulus_raw().resize::<64>())]);
+        let un = mbs(&u, &n).expect("n mul");
+
+        b.assert_zero(a * &bb - &c - &un);
+    }
+}
+
+impl GenerateRandomTrace<DEGREE_PLUS_ONE> for RsaModMulLimbUair {
+    type PolyCoeff = LimbInt;
+    type Int = LimbInt;
+
+    fn generate_random_trace<Rng: rand::RngCore + ?Sized>(
+        num_vars: usize,
+        rng: &mut Rng,
+    ) -> UairTrace<'static, LimbInt, LimbInt, DEGREE_PLUS_ONE> {
+        let len = 1usize << num_vars;
+        let n32 = modulus_raw();
+        let nz32: NonZero<crypto_bigint::Uint<32>> =
+            Option::from(NonZero::new(n32)).expect("N != 0");
+        let n64 = n32.resize::<64>();
+        let nz64: NonZero<crypto_bigint::Uint<64>> =
+            Option::from(NonZero::new(n64)).expect("N != 0");
+
+        let mut cols: Vec<Vec<LimbInt>> = (0..LIMB_COLS).map(|_| Vec::with_capacity(len)).collect();
+        for _ in 0..len {
+            let mut rand32 = |rng: &mut Rng| -> crypto_bigint::Uint<32> {
+                crypto_bigint::Uint::<32>::from_words(core::array::from_fn(|_| rng.next_u64()))
+            };
+            let a = rand32(rng).div_rem(&nz32).1;
+            let b = rand32(rng).div_rem(&nz32).1;
+            let a64 = a.resize::<64>();
+            let b64 = b.resize::<64>();
+            let (lo, _hi) = a64.widening_mul(&b64);
+            let (u, c) = lo.div_rem(&nz64);
+            for (k, v) in [a64, b64, c.resize::<64>(), u].iter().enumerate() {
+                for (i, limb) in limbs16(v).into_iter().enumerate() {
+                    cols[k * LIMBS_PER_VALUE + i].push(limb_int(limb));
+                }
+            }
+        }
+
+        UairTrace {
+            int: cols
+                .into_iter()
+                .map(|v| v.into_iter().collect::<DenseMultilinearExtension<_>>())
+                .collect::<Vec<_>>()
+                .into(),
+            ..Default::default()
+        }
+    }
+}
+
+//
+// Folded-4× instantiation: Int<34> cells quartered at radix 2^512
+// (generalized from the 2^64 ECDSA quartering) into Int<9> quarters
+// (512 magnitude bits + one sign-headroom limb).
+//
+
+const HALF_DEGREE_PLUS_ONE: usize = DEGREE_PLUS_ONE / 2; // 16
+const QUARTER_DEGREE_PLUS_ONE: usize = DEGREE_PLUS_ONE / 4; // 8
+const BIG_QUARTER: usize = 9; // quarter Eval limbs: 512-bit + headroom
+const BIG_QUARTER_CW: usize = 14; // quarter codeword limbs (mirrors BIG→BIG_CW growth)
+const BIG_QUARTER_M: usize = 18; // quarter combination-ring limbs
+
+type RsaQuarterIntZt = GenericBenchZipTypes<
+    Int<BIG_QUARTER>,
+    Int<BIG_QUARTER_CW>,
+    Uint<FIELD_LIMBS>,
+    MillerRabin,
+    i128,
+    i128,
+    Int<BIG_QUARTER_M>,
+    Int<BIG_QUARTER_M>,
+    ScalarProduct,
+    ScalarProduct,
+    MBSInnerProduct,
+>;
+
+#[derive(Clone, Debug)]
+struct RsaFolded4xZincTypes;
+
+impl IntFoldedZincTypes4x<DEGREE_PLUS_ONE, QUARTER_DEGREE_PLUS_ONE, BIG, BIG_QUARTER>
+    for RsaFolded4xZincTypes
+{
+    type Chal = i128;
+    type Pt = i128;
+    type Fmod = Uint<FIELD_LIMBS>;
+    type PrimeTest = MillerRabin;
+
+    type BinaryZt = GenericBenchZipTypes<
+        BinaryPoly<QUARTER_DEGREE_PLUS_ONE>,
+        DensePolynomial<i64, QUARTER_DEGREE_PLUS_ONE>,
+        Self::Fmod,
+        Self::PrimeTest,
+        Self::Chal,
+        Self::Pt,
+        Int<5>,
+        DensePolynomial<Int<5>, QUARTER_DEGREE_PLUS_ONE>,
+        BinaryPolyInnerProduct<Self::Chal, QUARTER_DEGREE_PLUS_ONE>,
+        DensePolyInnerProduct<
+            Int<5>,
+            Self::Chal,
+            Int<5>,
+            MBSInnerProduct,
+            QUARTER_DEGREE_PLUS_ONE,
+        >,
+        MBSInnerProduct,
+    >;
+    type ArbitraryZt = <RsaZincTypes as ZincTypes<DEGREE_PLUS_ONE>>::ArbitraryZt;
+    type IntZt = RsaQuarterIntZt;
+
+    type BinaryLc = IprsCode<Self::BinaryZt, PnttConfigF65537, REP, PERFORM_CHECKS>;
+    type ArbitraryLc = <RsaZincTypes as ZincTypes<DEGREE_PLUS_ONE>>::ArbitraryLc;
+    type IntLc = IprsCode<Self::IntZt, PnttConfigF65537, REP, PERFORM_CHECKS>;
+}
+
+type F4xBinaryZt = <RsaFolded4xZincTypes as IntFoldedZincTypes4x<
+    DEGREE_PLUS_ONE,
+    QUARTER_DEGREE_PLUS_ONE,
+    BIG,
+    BIG_QUARTER,
+>>::BinaryZt;
+type F4xArbitraryZt = <RsaFolded4xZincTypes as IntFoldedZincTypes4x<
+    DEGREE_PLUS_ONE,
+    QUARTER_DEGREE_PLUS_ONE,
+    BIG,
+    BIG_QUARTER,
+>>::ArbitraryZt;
+type F4xIntZt = <RsaFolded4xZincTypes as IntFoldedZincTypes4x<
+    DEGREE_PLUS_ONE,
+    QUARTER_DEGREE_PLUS_ONE,
+    BIG,
+    BIG_QUARTER,
+>>::IntZt;
+
+//
+// Harness
+//
+
+fn median(mut xs: Vec<f64>) -> f64 {
+    xs.sort_by(f64::total_cmp);
+    xs[xs.len() / 2]
+}
+
+fn ncols_label(n: usize) -> &'static str {
+    match n {
+        8 => "wide8",
+        16 => "wide16",
+        512 => "limb16",
+        _ => "",
+    }
+}
+
+macro_rules! run_case_for {
+    ($ufn:ident, $uty:ty, $ncols:literal) => {
+        run_case_for!($ufn, $uty, RsaZincTypes, $ncols, "");
+    };
+    ($ufn:ident, $uty:ty, $zt:ty, $ncols:literal, $tag:literal) => {
+#[allow(clippy::unwrap_used)]
+fn $ufn(num_vars: usize, reps: usize) {
+    type U = $uty;
+    type Zt = $zt;
+    macro_rules! piop {
+        () => {
+            ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>
+        };
+    }
+
+    let mut rng = rand::rng();
+    let t0 = Instant::now();
+    let trace = U::generate_random_trace(num_vars, &mut rng);
+    let witness_gen_s = t0.elapsed().as_secs_f64();
+
+    let poly_size = 1usize << num_vars;
+    // Optional rectangular Zip+ geometry (ROWLEN = matrix row length for
+    // all three families; default flat, row_len = poly_size).
+    let row_len: usize = std::env::var("ROWLEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(poly_size);
+    let pp = (
+        ZipPlus::<<Zt as ZincTypes<DEGREE_PLUS_ONE>>::BinaryZt, _>::setup(
+            row_len,
+            IprsCode::new_with_optimal_depth(row_len).unwrap(),
+        ),
+        ZipPlus::<<Zt as ZincTypes<DEGREE_PLUS_ONE>>::ArbitraryZt, _>::setup(
+            row_len,
+            IprsCode::new_with_optimal_depth(row_len).unwrap(),
+        ),
+        ZipPlus::<<Zt as ZincTypes<DEGREE_PLUS_ONE>>::IntZt, _>::setup(
+            row_len,
+            <<Zt as ZincTypes<DEGREE_PLUS_ONE>>::IntLc as BenchCode>::bench_new(row_len),
+        ),
+    );
+
+    let proof: Proof<F> =
+        <piop!()>::prove::<false, PERFORM_CHECKS>(&pp, &trace, num_vars, zinc_protocol::project_scalar_fn)
+            .expect("prove failed");
+
+    let mut prove_times = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let t0 = Instant::now();
+        let p: Proof<F> = <piop!()>::prove::<false, PERFORM_CHECKS>(
+            &pp,
+            &trace,
+            num_vars,
+            zinc_protocol::project_scalar_fn,
+        )
+        .expect("prove failed");
+        prove_times.push(t0.elapsed().as_secs_f64());
+        black_box(p);
+    }
+
+    let sig = U::signature();
+    let public_trace = trace.public(&sig);
+
+    let proj_ideal = |_: &IdealOrZero<<U as Uair>::Ideal>,
+                      _: &<F as PrimeField>::Config|
+     -> ImpossibleIdeal { unreachable!("only assert_zero constraints") };
+
+    let verify_once = |p: Proof<F>| {
+        <piop!()>::verify::<_, PERFORM_CHECKS>(
+            &pp,
+            p,
+            &public_trace,
+            num_vars,
+            zinc_protocol::project_scalar_fn,
+            proj_ideal,
+        )
+    };
+
+    match verify_once(proof.clone()) {
+        Ok(()) => {
+            let mut verify_times = Vec::with_capacity(reps);
+            for _ in 0..reps {
+                let p = proof.clone();
+                let t0 = Instant::now();
+                verify_once(p).expect("verify failed");
+                verify_times.push(t0.elapsed().as_secs_f64());
+            }
+            let prove_med = median(prove_times);
+            println!(
+                "RsaModMul2048[main-beta]{}{}/rate1-{REP}/sec{SECURITY_BITS} nvars={num_vars} ({} rows x {} cols, row_len={row_len}): witness-gen {:.3} s | prove median {:.3} s | prove+witgen {:.3} s | verify median {:.4} s ({} reps)",
+                ncols_label($ncols),
+                $tag,
+                1usize << num_vars,
+                $ncols,
+                witness_gen_s,
+                prove_med,
+                prove_med + witness_gen_s,
+                median(verify_times),
+                reps,
+            );
+        }
+        Err(e) => {
+            println!(
+                "RsaModMul2048[main-beta]{}{}/rate1-{REP}/sec{SECURITY_BITS} nvars={num_vars} ({} rows x {} cols, row_len={row_len}): witness-gen {:.3} s | prove median {:.3} s | VERIFY FAILED: {e:?} ({} reps)",
+                ncols_label($ncols),
+                $tag,
+                1usize << num_vars,
+                $ncols,
+                witness_gen_s,
+                median(prove_times),
+                reps,
+            );
+        }
+    }
+
+    eprint_proof_size(
+        format!(
+            "RsaModMul2048[main-beta]{}{}/rate1-{REP}/sec{SECURITY_BITS}/nvars={num_vars}/row_len={row_len}",
+            ncols_label($ncols),
+            $tag
+        ),
+        &proof,
+    );
+
+    // `STEPS=1`: one more prove, driven step by step, with per-step wall
+    // times (single run, not a median — indicative only).
+    if std::env::var("STEPS").is_ok() {
+        let mut lap = Instant::now();
+        let mut times: Vec<(&str, f64)> = Vec::new();
+        macro_rules! lap {
+            ($name:literal) => {{
+                times.push(($name, lap.elapsed().as_secs_f64()));
+                lap = Instant::now();
+            }};
+        }
+        let s = <piop!()>::step0_commit(&pp, &trace, num_vars).expect("step0");
+        lap!("0 commit");
+        // 0a / 0b: the int lane's commit split into IPRS encoding and
+        // Merkle hashing (re-done here outside the protocol; the two
+        // together are the "0 commit" line above for an int-only trace).
+        let (t_enc, t_mt) = {
+            let sig = U::signature();
+            let witness = trace.witness(&sig);
+            let t = Instant::now();
+            let cw: Vec<_> = witness
+                .int
+                .iter()
+                .map(|poly| {
+                    ZipPlus::<<Zt as ZincTypes<DEGREE_PLUS_ONE>>::IntZt, _>::encode_rows(
+                        &pp.2,
+                        &poly.evaluations,
+                    )
+                })
+                .collect();
+            let t_enc = t.elapsed().as_secs_f64();
+            let rows: Vec<&[_]> = cw.iter().flat_map(|m| m.as_rows()).collect();
+            let t = Instant::now();
+            let mt = zip_plus::merkle::MerkleTree::new(&rows);
+            let t_mt = t.elapsed().as_secs_f64();
+            black_box(mt);
+            (t_enc, t_mt)
+        };
+        lap = Instant::now();
+        let s = s.step1_combined(zinc_protocol::project_scalar_fn).expect("step1");
+        lap!("1 prime projection");
+        let s = s.step2_ideal_check().expect("step2");
+        lap!("2 ideal check");
+        let s = s.step3_eval_projection().expect("step3");
+        lap!("3 eval projection");
+        let s = s.step4_sumcheck().expect("step4");
+        lap!("4 CPR+booleanity sumcheck");
+        let s = s.step4b_lookup().expect("step4b");
+        lap!("4b lookup (GKR-LogUp)");
+        let s = s.step5_multipoint_eval().expect("step5");
+        lap!("5 multipoint eval");
+        let s = s.step6_lift_and_project().expect("step6");
+        lap!("6 lift-and-project");
+        let s = s.step7_pcs_open::<PERFORM_CHECKS>().expect("step7");
+        lap!("7 PCS open (+reducers)");
+        let p: Proof<F> = s.finish().expect("finish");
+        lap!("8 assembly");
+        black_box(p);
+        let total: f64 = times.iter().map(|(_, t)| t).sum();
+        eprintln!("    per-step prover times (one run, total {total:.3} s):");
+        for (name, t) in &times {
+            eprintln!("      {name:<28} {t:8.3} s  ({:5.1}%)", 100.0 * t / total);
+        }
+        eprintln!(
+            "      (0 commit, int lane re-run, one column at a time: encode {t_enc:.3} s, merkle {t_mt:.3} s)"
+        );
+    }
+}
+    };
+}
+
+run_case_for!(run_case, RsaModMulUair, 4);
+run_case_for!(run_case_wide8, RsaModMulWideUair, 8);
+run_case_for!(run_case_wide16, RsaModMulWide16Uair, 16);
+run_case_for!(run_case_limb16, RsaModMulLimbUair, RsaLimbZincTypes, 512, "/limb16+rangecheck");
+
+macro_rules! run_case_folded_for {
+    ($ufn:ident, $uty:ty, $ncols:literal) => {
+#[allow(clippy::unwrap_used)]
+fn $ufn(num_vars: usize, reps: usize) {
+    type U = $uty;
+
+    let mut rng = rand::rng();
+    let t0 = Instant::now();
+    let trace = U::generate_random_trace(num_vars, &mut rng);
+    let witness_gen_s = t0.elapsed().as_secs_f64();
+
+    // Folded-4× geometry: binary and int lanes commit at 4n.
+    let split4_size = 1usize << (num_vars + 2);
+    let normal_size = 1usize << num_vars;
+    let pp = (
+        ZipPlus::<F4xBinaryZt, _>::setup(
+            split4_size,
+            IprsCode::new_with_optimal_depth(split4_size).unwrap(),
+        ),
+        ZipPlus::<F4xArbitraryZt, _>::setup(
+            normal_size,
+            IprsCode::new_with_optimal_depth(normal_size).unwrap(),
+        ),
+        ZipPlus::<F4xIntZt, _>::setup(
+            split4_size,
+            IprsCode::new_with_optimal_depth(split4_size).unwrap(),
+        ),
+    );
+
+    let do_prove = || {
+        zinc_protocol::prover::prove_folded_4x::<
+            RsaFolded4xZincTypes,
+            U,
+            F,
+            DEGREE_PLUS_ONE,
+            HALF_DEGREE_PLUS_ONE,
+            QUARTER_DEGREE_PLUS_ONE,
+            BIG,
+            BIG_QUARTER,
+            false,
+            PERFORM_CHECKS,
+        >(&pp, &trace, num_vars, zinc_protocol::project_scalar_fn)
+    };
+
+    let proof: Proof<F> = do_prove().expect("folded prove failed");
+
+    let mut prove_times = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let t0 = Instant::now();
+        let p: Proof<F> = do_prove().expect("folded prove failed");
+        prove_times.push(t0.elapsed().as_secs_f64());
+        black_box(p);
+    }
+
+    let sig = U::signature();
+    let public_trace = trace.public(&sig);
+
+    let proj_ideal = |_: &IdealOrZero<<U as Uair>::Ideal>,
+                      _: &<F as PrimeField>::Config|
+     -> ImpossibleIdeal { unreachable!("only assert_zero constraints") };
+
+    let verify_once = |p: Proof<F>| {
+        zinc_protocol::verifier::verify_folded_4x::<
+            RsaFolded4xZincTypes,
+            U,
+            F,
+            ImpossibleIdeal,
+            DEGREE_PLUS_ONE,
+            HALF_DEGREE_PLUS_ONE,
+            QUARTER_DEGREE_PLUS_ONE,
+            BIG,
+            BIG_QUARTER,
+            PERFORM_CHECKS,
+        >(
+            &pp,
+            p,
+            &public_trace,
+            num_vars,
+            zinc_protocol::project_scalar_fn,
+            proj_ideal,
+        )
+    };
+
+    match verify_once(proof.clone()) {
+        Ok(()) => {
+            let mut verify_times = Vec::with_capacity(reps);
+            for _ in 0..reps {
+                let p = proof.clone();
+                let t0 = Instant::now();
+                verify_once(p).expect("verify failed");
+                verify_times.push(t0.elapsed().as_secs_f64());
+            }
+            let prove_med = median(prove_times);
+            println!(
+                "RsaModMul2048[main-beta]{}/folded4x/rate1-{REP}/sec{SECURITY_BITS} nvars={num_vars} ({} rows x {} cols, split4_row_len={split4_size}): witness-gen {:.3} s | prove median {:.3} s | prove+witgen {:.3} s | verify median {:.4} s ({} reps)",
+                ncols_label($ncols),
+                1usize << num_vars,
+                $ncols,
+                witness_gen_s,
+                prove_med,
+                prove_med + witness_gen_s,
+                median(verify_times),
+                reps,
+            );
+        }
+        Err(e) => {
+            println!(
+                "RsaModMul2048[main-beta]{}/folded4x/rate1-{REP}/sec{SECURITY_BITS} nvars={num_vars} ({} rows x {} cols, split4_row_len={split4_size}): witness-gen {:.3} s | prove median {:.3} s | VERIFY FAILED: {e:?} ({} reps)",
+                ncols_label($ncols),
+                1usize << num_vars,
+                $ncols,
+                witness_gen_s,
+                median(prove_times),
+                reps,
+            );
+        }
+    }
+
+    eprint_proof_size(
+        format!(
+            "RsaModMul2048[main-beta]{}/folded4x/rate1-{REP}/sec{SECURITY_BITS}/nvars={num_vars}/split4_row_len={split4_size}",
+            ncols_label($ncols)
+        ),
+        &proof,
+    );
+}
+    };
+}
+
+run_case_folded_for!(run_case_folded, RsaModMulUair, 4);
+run_case_folded_for!(run_case_folded_wide8, RsaModMulWideUair, 8);
+run_case_folded_for!(run_case_folded_wide16, RsaModMulWide16Uair, 16);
+
+fn main() {
+    let reps: usize = std::env::var("REPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let limb16 = std::env::var("LIMB16").is_ok();
+    let nvars_list: Vec<usize> = std::env::var("NVARS")
+        .ok()
+        .map(|s| s.split(',').map(|x| x.parse().expect("bad NVARS")).collect())
+        .unwrap_or_else(|| vec![if limb16 { 13 } else { 12 }]);
+
+    eprintln!(
+        "single-threaded={} checks={} rate=1/{} security={} bits openings={} projecting-prime=transcript-drawn {}-bit (features: parallel={}, unchecked={})",
+        cfg!(not(feature = "parallel")),
+        PERFORM_CHECKS,
+        REP,
+        SECURITY_BITS,
+        NUM_COL_OPENINGS_FOR_REP,
+        64 * FIELD_LIMBS,
+        cfg!(feature = "parallel"),
+        cfg!(feature = "unchecked"),
+    );
+    let wide8 = std::env::var("WIDE8").is_ok();
+    let wide16 = std::env::var("WIDE16").is_ok();
+    let folded = std::env::var("FOLD").is_ok();
+    for nv in nvars_list {
+        if limb16 {
+            // Range-checked 16-bit-limb statement: 512 int columns, one
+            // modmul per row (nvars = 13 ⇔ 8192 modmuls ⊇ 6,209).
+            run_case_limb16(nv, reps);
+            continue;
+        }
+        match (folded, wide16, wide8) {
+            (true, true, _) => run_case_folded_wide16(nv, reps),
+            (true, false, true) => run_case_folded_wide8(nv, reps),
+            (true, false, false) => run_case_folded(nv, reps),
+            (false, true, _) => run_case_wide16(nv, reps),
+            (false, false, true) => run_case_wide8(nv, reps),
+            (false, false, false) => run_case(nv, reps),
+        }
+    }
+}

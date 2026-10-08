@@ -1,6 +1,23 @@
 # Z[X] range checks — design
 
-Branch: `lookup` (off `main-beta`, the integer path). Status: design, no code yet.
+Branch: `lookup` (off `main-beta`, the integer path). Status: design note;
+**the int-column range check shipped on `main-beta` (2026-09-08)** — see the
+status paragraph below. The rest of the note is the original design menu.
+
+**Status 2026-09-08.** Integer cells are range-checked by declaring
+`LookupTableType::Word { width, chunk_width: None }` on witness int columns
+(`piop/src/lookup/gkr_logup/protocol.rs::prove_group_int` /
+`verify_group_int`, wired at protocol step 4b/7). It is the M2 GKR-LogUp
+run directly on the projected int cells — one LogUp instance per group whose
+"chunks" are the columns, one multiplicity vector over the `2^width` table,
+and the per-column evals at the GKR point discharged by an **int multipoint
+reducer** (`piop/src/int_multipoint_reducer.rs`) folded into the single int
+Zip+ open. No chunk columns are committed: for big values the UAIR itself
+uses narrow limb columns (e.g. the Limber MultiSwap statement as `4 × 128`
+16-bit limbs per modmul, `protocol/benches/limber_multiswap.rs`, `LIMB16=1`)
+and recombines them inside the constraint, so this is R3 with the chunks
+being first-class int columns rather than a fourth commitment lane. R1 / R2
+remain unimplemented.
 
 Goal: a **sound, declarable range-check primitive** for the integer path — assert
 each entry of a designated witness quantity lies in `[0, B]` (or a power-of-two

@@ -37,6 +37,7 @@ use zinc_uair::{
     ideal_collector::IdealOrZero,
 };
 use zinc_utils::{
+    field::runtime_monty::Fp,
     from_ref::FromRef,
     inner_product::{InnerProduct, MBSInnerProduct, ScalarProduct},
     mul_by_scalar::MulByScalar,
@@ -72,15 +73,11 @@ const REP: usize = if cfg!(feature = "iprs-rate-1-16") {
     4
 };
 
-/// Number of column openings the PCS performs. Tied to `REP`: rate 1/4
-/// uses 150 openings, rate 1/8 uses 100, rate 1/16 uses 75.
-const NUM_COL_OPENINGS_FOR_REP: usize = if cfg!(feature = "iprs-rate-1-16") {
-    75
-} else if cfg!(feature = "iprs-rate-1-8") {
-    100
-} else {
-    150
-};
+/// Number of column openings the PCS performs for `SECURITY_BITS` bits at
+/// rate `1/REP` (150 / 100 / 75 at 100 bits for rates 1/4, 1/8, 1/16; see
+/// `zip_plus::pcs::structs::num_column_openings`).
+const NUM_COL_OPENINGS_FOR_REP: usize =
+    zip_plus::pcs::structs::num_column_openings(REP, zinc_protocol::SECURITY_BITS);
 
 #[allow(clippy::type_complexity)]
 #[derive(Debug, Clone, Copy)]
@@ -260,6 +257,8 @@ where
     Fmod: ConstIntSemiring + ConstTranscribable + Named,
     PrimeTest: PrimalityTest<Fmod> + Debug + Send + Sync,
 {
+    const FIXED_PROJECTING_PRIME: Option<&'static [u8]> =
+        Some(&zinc_protocol::fixed_prime::SECP256K1_P_LE_BYTES);
     type Int = Int;
     type Chal = Chal;
     type Pt = Pt;
@@ -321,7 +320,10 @@ const INT_LIMBS: usize = U64::LIMBS;
 // fixed secp256k1 base prime fits in `Fmod = Uint<FIELD_LIMBS>`.
 const FIELD_LIMBS: usize = U64::LIMBS * 4;
 
-type F = MontyField<FIELD_LIMBS>;
+// Value-sized field with the modulus installed once into `ProofSlot` (drop-in
+// for `MontyField<FIELD_LIMBS>`; see utils/src/field/runtime_monty.rs).
+zinc_utils::define_modulus!(ProofSlot, FIELD_LIMBS);
+type F = Fp<ProofSlot, FIELD_LIMBS>;
 
 type BenchZincTypes = GenericBenchZincTypes<
     /* Int         = */ i64,
@@ -603,7 +605,8 @@ fn do_bench_steps<Zt, U, IdealOverF>(
     let p_ideal_checked = p_projected.clone().step2_ideal_check().unwrap();
     let p_eval_projected = p_ideal_checked.clone().step3_eval_projection().unwrap();
     let p_sumchecked = p_eval_projected.clone().step4_sumcheck().unwrap();
-    let p_mp_evaled = p_sumchecked.clone().step5_multipoint_eval().unwrap();
+    let p_lookup_proved = p_sumchecked.clone().step4b_lookup().unwrap();
+    let p_mp_evaled = p_lookup_proved.clone().step5_multipoint_eval().unwrap();
     let p_lifted = p_mp_evaled.clone().step6_lift_and_project().unwrap();
 
     step_bench!(
@@ -654,8 +657,14 @@ fn do_bench_steps<Zt, U, IdealOverF>(
     );
 
     step_bench!(
-        "Prove" / "5: Multi-point eval",
+        "Prove" / "4b: Lookup (GKR-LogUp)",
         setup = || p_sumchecked.clone(),
+        run = |s| s.step4b_lookup(),
+    );
+
+    step_bench!(
+        "Prove" / "5: Multi-point eval",
+        setup = || p_lookup_proved.clone(),
         run = |s| s.step5_multipoint_eval(),
     );
 
@@ -701,7 +710,12 @@ fn do_bench_steps<Zt, U, IdealOverF>(
         .clone()
         .step3_eval_projection(project_scalar)
         .unwrap();
-    let v_sumchecked = v_eval_projected.clone().step4_sumcheck_verify().unwrap();
+    let v_sumchecked = v_eval_projected
+        .clone()
+        .step4_sumcheck_verify()
+        .unwrap()
+        .step4b_lookup_verify::<U>()
+        .unwrap();
     let v_mp_evaled = v_sumchecked.clone().step5_multipoint_eval::<U>().unwrap();
     let v_lifted = v_mp_evaled.clone().step6_lifted_evals::<U>().unwrap();
 
@@ -1892,6 +1906,8 @@ fn eprint_folded_4x_zip_substep_breakdown<F>(
 struct BenchFoldedRealEcdsaZincTypes;
 
 impl FoldedZincTypes<DEGREE_PLUS_ONE, HALF_DEGREE_PLUS_ONE> for BenchFoldedRealEcdsaZincTypes {
+    const FIXED_PROJECTING_PRIME: Option<&'static [u8]> =
+        Some(&zinc_protocol::fixed_prime::SECP256K1_P_LE_BYTES);
     type Int = RealEcdsaInt;
     type Chal = i128;
     type Pt = i128;
@@ -1979,6 +1995,8 @@ impl
         INT_QUARTER_LIMBS_BENCH,
     > for BenchFoldedRealEcdsaZincTypes4x
 {
+    const FIXED_PROJECTING_PRIME: Option<&'static [u8]> =
+        Some(&zinc_protocol::fixed_prime::SECP256K1_P_LE_BYTES);
     type Chal = i128;
     type Pt = i128;
     type Fmod = Uint<FIELD_LIMBS>;
