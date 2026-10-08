@@ -27,7 +27,7 @@ use zinc_piop::{
     sumcheck::multi_degree::MultiDegreeSumcheck,
 };
 use zinc_poly::{
-    EvaluatablePolynomial, mle::MultilinearExtensionWithConfig,
+    EvaluatablePolynomial, Polynomial, mle::MultilinearExtensionWithConfig,
     univariate::dynamic::over_field::DynamicPolynomialF,
 };
 use zinc_transcript::{

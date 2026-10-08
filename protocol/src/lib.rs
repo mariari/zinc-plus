@@ -665,6 +665,8 @@ pub enum ProtocolError<F: PrimeField, I: Ideal> {
     MultipointEval(#[from] MultipointEvalError<F>),
     #[error("lifted eval psi_a projection failed: {0}")]
     LiftedEvalProjection(PolyEvaluationError),
+    #[error("lifted eval at column {column} has more coefficients than its lane commits")]
+    LiftedEvalDegree { column: usize },
     #[error("lifted_evals bit-op consistency mismatch at bit_op spec {spec}")]
     LiftedEvalsBitOpMismatch { spec: usize },
     #[error("lookup argument failed: {0}")]
