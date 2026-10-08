@@ -1039,6 +1039,21 @@ where
         };
 
         let witness_lifted_evals = &self.proof_witness_lifted_evals;
+        // The PCS opening only binds DEGREE_BOUND + 1 coefficients of a lift; reject longer ones.
+        let degree_bound = |column: usize| match column {
+            c if c < num_wit_bin => <Zt::BinaryZt as ZipTypes>::Comb::DEGREE_BOUND,
+            c if c < add!(num_wit_bin, num_wit_arb) => {
+                <Zt::ArbitraryZt as ZipTypes>::Comb::DEGREE_BOUND
+            }
+            _ => <Zt::IntZt as ZipTypes>::Comb::DEGREE_BOUND,
+        };
+        if let Some(column) = witness_lifted_evals
+            .iter()
+            .enumerate()
+            .position(|(c, bar_u)| bar_u.coeffs.len() > add!(degree_bound(c), 1))
+        {
+            return Err(ProtocolError::LiftedEvalDegree { column });
+        }
 
         let all_lifted_evals: Vec<_> = public_lifted[..num_pub_bin]
             .iter()

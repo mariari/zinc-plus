@@ -1954,6 +1954,99 @@ mod tests {
     }
 
     #[test]
+    fn test_big_linear_tamper_int_lift_degree() {
+        let num_vars = 8;
+        do_test::<TestZincTypesIprs, BigLinearUair<ZtInt>>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+            default_project_ideal!(),
+            |proof| {
+                let lift = proof.witness_lifted_evals.last_mut().unwrap();
+                lift.coeffs.push(lift.coeffs[0].clone() - lift.coeffs[0].clone());
+            },
+            |res| assert!(matches!(res, Err(ProtocolError::LiftedEvalDegree { .. }))),
+        );
+    }
+
+    /// A false trace proved through int lifts that carry an extra coefficient.
+    #[test]
+    fn test_big_linear_forged_int_lift_rejected() {
+        use zinc_poly::EvaluatablePolynomial;
+        use zinc_uair::UairTrace;
+        type U = BigLinearUair<ZtInt>;
+        type Zt = TestZincTypesIprs;
+        type Piop = ZincPlusPiop<Zt, U, F, DEGREE_PLUS_ONE>;
+        let num_vars = 8;
+        let mut rng = rng();
+        let pp = setup_pp::<Zt>(
+            num_vars,
+            (make_iprs(num_vars), make_iprs(num_vars), make_iprs(num_vars)),
+        );
+        let honest = U::generate_random_trace(num_vars, &mut rng);
+        let mut int_cols: Vec<DenseMultilinearExtension<ZtInt>> = honest.int.to_vec();
+        int_cols[0].evaluations[3] += 1;
+        let committed: UairTrace<'static, ZtInt, ZtInt, DEGREE_PLUS_ONE> = UairTrace {
+            int: int_cols.clone().into(),
+            ..honest.clone()
+        };
+        let public_trace = committed.public(&U::signature());
+
+        let mut base = Piop::step0_commit(&pp, &committed, num_vars).expect("commit");
+        base.trace = &honest;
+        let lookup = base
+            .step1_combined(project_scalar_fn)
+            .unwrap()
+            .step2_ideal_check()
+            .unwrap()
+            .step3_eval_projection()
+            .unwrap()
+            .step4_sumcheck()
+            .unwrap()
+            .step4b_lookup()
+            .unwrap();
+        let a = lookup.projecting_element_f.clone();
+        let mp = lookup.step5_multipoint_eval().unwrap();
+        let before = mp.base.clone();
+        let mut lifted = mp.step6_lift_and_project().unwrap();
+        let cfg = lifted.field_cfg.clone();
+        let eq = zinc_poly::utils::build_eq_x_r_vec(&lifted.r_0, &cfg).unwrap();
+        let zero = F::zero_with_cfg(&cfg);
+        let int_start = lifted.lifted_evals.len() - int_cols.len();
+        for (j, col) in int_cols.iter().enumerate() {
+            let committed_eval = col.evaluations.iter().zip(&eq).fold(zero.clone(), |acc, (v, e)| {
+                acc + F::from_with_cfg(v, &cfg) * e.clone()
+            });
+            let honest_eval = lifted.lifted_evals[int_start + j].evaluate_at_point(&a).unwrap();
+            let shift = (honest_eval - committed_eval.clone()) * a.inv().unwrap();
+            lifted.lifted_evals[int_start + j] =
+                DynamicPolynomialF::new(vec![committed_eval, shift]);
+        }
+        let mut base = before;
+        let mut buf = vec![0u8; <F as Field>::Inner::NUM_BYTES];
+        for bar_u in &lifted.lifted_evals {
+            base.pcs_transcript
+                .fs_transcript
+                .absorb_random_field_slice(&bar_u.coeffs, &mut buf);
+        }
+        base.trace = &committed;
+        lifted.base = base;
+        let proof = lifted.step7_pcs_open::<CHECKED>().unwrap().finish().unwrap();
+        let res = Piop::verify::<_, CHECKED>(
+            &pp,
+            proof,
+            &public_trace,
+            num_vars,
+            project_scalar_fn,
+            default_project_ideal!(),
+        );
+        assert!(matches!(res, Err(ProtocolError::LiftedEvalDegree { .. })), "{res:?}");
+    }
+
+    #[test]
     fn test_big_linear_tamper_up_evals() {
         let num_vars = 8;
         do_test::<TestZincTypesIprs, BigLinearUairWithPublicInput<ZtInt>>(

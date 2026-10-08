@@ -86,8 +86,8 @@ fn filter_booleanity_witness<const D: usize>(
 pub struct ProverBase<'a, Zt: ZincTypes<D>, U: Uair, F: PrimeField, const D: usize> {
     num_vars: usize,
     uair_signature: UairSignature,
-    pcs_transcript: PcsProverTranscript,
-    trace: &'a UairTrace<'static, Zt::Int, Zt::Int, D>,
+    pub(crate) pcs_transcript: PcsProverTranscript,
+    pub(crate) trace: &'a UairTrace<'static, Zt::Int, Zt::Int, D>,
 
     // Commitment info
     pp_bin: &'a ZipPlusParams<Zt::BinaryZt, Zt::BinaryLc>,
@@ -202,7 +202,7 @@ pub struct ProverLookupProved<'a, Zt: ZincTypes<D>, U: Uair, F: PrimeField, cons
     field_cfg: F::Config,
     projected_trace: ProjectedTrace<F>,
     ic_proof: IdealCheckProof<F>,
-    projecting_element_f: F,
+    pub(crate) projecting_element_f: F,
     projected_trace_f: Vec<DenseMultilinearExtension<F::Inner>>,
     cpr_proof: CombinedPolyResolverProof<F>,
     cpr_eval_point: Vec<F>,
@@ -214,7 +214,7 @@ pub struct ProverLookupProved<'a, Zt: ZincTypes<D>, U: Uair, F: PrimeField, cons
 /// After step 5 (multipoint eval).
 #[derive(Clone, Debug)]
 pub struct ProverMultipointEvaled<'a, Zt: ZincTypes<D>, U: Uair, F: PrimeField, const D: usize> {
-    base: ProverBase<'a, Zt, U, F, D>,
+    pub(crate) base: ProverBase<'a, Zt, U, F, D>,
     field_cfg: F::Config,
     projected_trace: ProjectedTrace<F>,
     ic_proof: IdealCheckProof<F>,
@@ -234,8 +234,8 @@ pub struct ProverMultipointEvaled<'a, Zt: ZincTypes<D>, U: Uair, F: PrimeField, 
 /// After step 6 (lift-and-project).
 #[derive(Clone, Debug)]
 pub struct ProverLifted<'a, Zt: ZincTypes<D>, U: Uair, F: PrimeField, const D: usize> {
-    base: ProverBase<'a, Zt, U, F, D>,
-    field_cfg: F::Config,
+    pub(crate) base: ProverBase<'a, Zt, U, F, D>,
+    pub(crate) field_cfg: F::Config,
     ic_proof: IdealCheckProof<F>,
     cpr_proof: CombinedPolyResolverProof<F>,
     combined_sumcheck: MultiDegreeSumcheckProof<F>,
@@ -243,10 +243,10 @@ pub struct ProverLifted<'a, Zt: ZincTypes<D>, U: Uair, F: PrimeField, const D: u
     lookup_r_inners: Vec<Vec<F>>,
     projected_trace_f: Vec<DenseMultilinearExtension<F::Inner>>,
     mp_proof: MultipointEvalProof<F>,
-    r_0: Vec<F>,
+    pub(crate) r_0: Vec<F>,
 
     // New
-    lifted_evals: Vec<DynamicPolynomialF<F>>,
+    pub(crate) lifted_evals: Vec<DynamicPolynomialF<F>>,
 }
 
 impl<'a, Zt: ZincTypes<D>, U: Uair, F: PrimeField, const D: usize>
