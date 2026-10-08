@@ -52,7 +52,9 @@ pub(crate) mod test_capture {
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-use crypto_primitives::{ConstIntRing, ConstIntSemiring, FromWithConfig, PrimeField, Semiring};
+use crypto_primitives::{
+    ConstIntRing, ConstIntSemiring, FromPrimitiveWithConfig, FromWithConfig, PrimeField, Semiring,
+};
 use std::{fmt::Debug, marker::PhantomData};
 use thiserror::Error;
 use zinc_piop::{
@@ -77,7 +79,10 @@ use zinc_poly::{
 use zinc_primality::PrimalityTest;
 use zinc_transcript::traits::{ConstTranscribable, GenTranscribable, Transcribable, Transcript};
 use zinc_uair::{Uair, ideal::Ideal};
-use zinc_utils::{cfg_extend, cfg_into_iter, cfg_iter, named::Named};
+use zinc_utils::{
+    cfg_extend, cfg_into_iter, cfg_iter, inner_transparent_field::InnerTransparentField, mul,
+    named::Named,
+};
 use zip_plus::{
     ZipError,
     code::LinearCode,
@@ -132,15 +137,15 @@ pub struct Proof<F: PrimeField> {
     /// computing the alpha-projected eval for the single bin Zip+
     /// open at `r*`.
     pub bin_lifts_at_r_star: Vec<DynamicPolynomialF<F>>,
-    /// Multi-point reducer proof for the integer batch — `Some` iff the
-    /// UAIR declares a lookup group over integer columns. Reduces every
-    /// such group's `r_inner` claim plus the step-7 `r_0` claim into ONE
-    /// Zip+ opening at the reduced point `r*`. `None` otherwise; step 7
-    /// then opens the int commitment at `r_0` directly.
+    /// Int twin of `bin_reducer_proof` — `Some` iff the UAIR has at least
+    /// one `Word`-table (int range-check) lookup group: the int multipoint
+    /// reducer folds every int-group `r_inner` claim plus the step-7 `r_0`
+    /// claim into ONE int Zip+ open at its reduced point. `None` otherwise
+    /// (int opened at `r_0` directly).
     pub int_reducer_proof: Option<BinReducerProof<F>>,
-    /// Polynomial-valued MLE evals at `r*` for each witness integer
+    /// Scalar MLE evals at the int reducer's `r*` for each witness int
     /// column, in column order. Empty when `int_reducer_proof` is `None`.
-    pub int_lifts_at_r_star: Vec<DynamicPolynomialF<F>>,
+    pub int_evals_at_r_star: Vec<F>,
     /// Pointer-query (composed read) proof — `Some` iff the UAIR
     /// declares composed reads. See
     /// `documentation/pointer-query-design.md`.
@@ -160,7 +165,7 @@ pub struct Proof<F: PrimeField> {
 
 impl<F> GenTranscribable for Proof<F>
 where
-    F: PrimeField,
+    F: InnerTransparentField + FromPrimitiveWithConfig,
     F::Inner: ConstTranscribable,
     F::Modulus: ConstTranscribable,
 {
@@ -213,15 +218,23 @@ where
             v => panic!("invalid bin_reducer_proof presence flag: {v}"),
         };
 
-        // [int_reducer_present: u8] [reducer_proof? : subset] [int_lifts? : subset]
-        let int_reducer_present = bytes[0];
+        // [int_reducer_present: u8] [reducer_proof? : subset]
+        // [modulus] [u32 n] [n × F::Inner]   (the last three only if present)
+        let int_present = bytes[0];
         let bytes = &bytes[1..];
-        let (int_reducer_proof, int_lifts_at_r_star, bytes) = match int_reducer_present {
+        let (int_reducer_proof, int_evals_at_r_star, bytes) = match int_present {
             0 => (None, Vec::new(), bytes),
             1 => {
                 let (rp, rest) = BinReducerProof::<F>::read_transcription_bytes_subset(bytes);
-                let (bv, rest) = DynamicPolyVecF::<F>::read_transcription_bytes_subset(rest);
-                (Some(rp), bv.0, rest)
+                let mod_size = F::Modulus::NUM_BYTES;
+                let cfg = zinc_transcript::read_field_cfg::<F>(&rest[..mod_size]);
+                let rest = &rest[mod_size..];
+                let (n, rest) = u32::read_transcription_bytes_subset(rest);
+                let n = usize::try_from(n).expect("int eval count must fit in usize");
+                let inner_size = F::Inner::NUM_BYTES;
+                let (evals_bytes, rest) = rest.split_at(mul!(n, inner_size));
+                let evals = zinc_transcript::read_field_vec_with_cfg::<F>(evals_bytes, &cfg);
+                (Some(rp), evals, rest)
             }
             v => panic!("invalid int_reducer_proof presence flag: {v}"),
         };
@@ -254,7 +267,7 @@ where
             bin_reducer_proof,
             bin_lifts_at_r_star,
             int_reducer_proof,
-            int_lifts_at_r_star,
+            int_evals_at_r_star,
             pointer_query_proof,
             pq_int_lifted_at_r_a,
             pq_int_lifted_at_r_b,
@@ -322,42 +335,27 @@ where
             }
         };
 
-        // [int_reducer_present: u8] then optional reducer proof + int lifts.
-        let buf = match &self.int_reducer_proof {
+        // [int_reducer_present: u8] then optional reducer_proof + modulus +
+        // [u32 n] + n × F::Inner (the evals at the int reducer's r*).
+        match &self.int_reducer_proof {
             None => {
                 assert!(
-                    self.int_lifts_at_r_star.is_empty(),
-                    "int_lifts_at_r_star must be empty when the int reducer is absent"
+                    self.int_evals_at_r_star.is_empty(),
+                    "int_evals_at_r_star must be empty when the int reducer is absent"
                 );
                 buf[0] = 0;
-                &mut buf[1..]
             }
             Some(rp) => {
                 buf[0] = 1;
                 let buf = &mut buf[1..];
                 let buf = rp.write_transcription_bytes_subset(buf);
-                DynamicPolyVecF::reinterpret(&self.int_lifts_at_r_star)
-                    .write_transcription_bytes_subset(buf)
-            }
-        };
-
-        // [pq_present: u8] then optional pointer-query proof + lifted evals.
-        match &self.pointer_query_proof {
-            None => {
-                assert!(
-                    self.pq_int_lifted_at_r_a.is_empty() && self.pq_int_lifted_at_r_b.is_empty(),
-                    "pq lifted evals must be empty when the pointer query is absent"
-                );
-                buf[0] = 0;
-            }
-            Some(pq) => {
-                buf[0] = 1;
-                let buf = &mut buf[1..];
-                let buf = pq.write_transcription_bytes_subset(buf);
-                let buf = DynamicPolyVecF::reinterpret(&self.pq_int_lifted_at_r_a)
-                    .write_transcription_bytes_subset(buf);
-                DynamicPolyVecF::reinterpret(&self.pq_int_lifted_at_r_b)
-                    .write_transcription_bytes_subset(buf);
+                let modulus = rp.sumcheck_proof.claimed_sum.modulus();
+                let buf = zinc_transcript::append_field_cfg::<F>(buf, &modulus);
+                let n = u32::try_from(self.int_evals_at_r_star.len())
+                    .expect("int eval count must fit in u32");
+                n.write_transcription_bytes_exact(&mut buf[..u32::NUM_BYTES]);
+                let buf = &mut buf[u32::NUM_BYTES..];
+                zinc_transcript::append_field_vec_inner(buf, &self.int_evals_at_r_star);
             }
         }
     }
@@ -365,7 +363,7 @@ where
 
 impl<F> Transcribable for Proof<F>
 where
-    F: PrimeField,
+    F: InnerTransparentField + FromPrimitiveWithConfig,
     F::Inner: ConstTranscribable,
     F::Modulus: ConstTranscribable,
 {
@@ -411,11 +409,11 @@ where
             + match &self.int_reducer_proof {
                 None => 0,
                 Some(rp) => {
-                    let iv = DynamicPolyVecF::reinterpret(&self.int_lifts_at_r_star);
                     BinReducerProof::<F>::LENGTH_NUM_BYTES
                         + rp.get_num_bytes()
-                        + DynamicPolyVecF::<F>::LENGTH_NUM_BYTES
-                        + iv.get_num_bytes()
+                        + F::Modulus::NUM_BYTES
+                        + u32::NUM_BYTES
+                        + self.int_evals_at_r_star.len() * F::Inner::NUM_BYTES
                 }
             }
             + 1 // pq_present flag
@@ -434,6 +432,22 @@ where
             }
     }
 }
+
+/// Target security level (bits) of this crate's tests and benches: 100 by
+/// default, raised by the `sec-114` / `sec-128` cargo features. It sets the
+/// Zip+ column-opening count for the chosen code rate
+/// ([`zip_plus::pcs::structs::num_column_openings`]) and, where the
+/// projecting prime is transcript-drawn, guides the prime width the benches
+/// pick (128-bit up to 100 bits, 192-bit above — the fingerprinting error
+/// is `≈ (bit-size of the largest constraint residue) / 2^(prime bits)`, and
+/// the LogUp lookups spend `≈ (#lookups + table size) / 2^(prime bits)`).
+pub const SECURITY_BITS: usize = if cfg!(feature = "sec-128") {
+    128
+} else if cfg!(feature = "sec-114") {
+    114
+} else {
+    100
+};
 
 /// Trait bundling the various type parameters for the public inputs (NYI),
 /// witness and Zinc+ PIOP.
@@ -464,6 +478,21 @@ pub trait ZincTypes<const DEGREE_PLUS_ONE: usize>: Clone + Debug {
 
     /// Primality test for the field modulus.
     type PrimeTest: PrimalityTest<Self::Fmod>;
+
+    /// The projecting prime `q` of Step 1 (`\phi_q : Z[X] -> F_q[X]`).
+    ///
+    /// `None` (the default): `q` is drawn from the Fiat–Shamir transcript
+    /// after the witness commitments — the sound, general behaviour. The
+    /// prime has exactly `8 · Fmod::NUM_BYTES` bits, so `Fmod` sizes it
+    /// (`Uint<2>` → 128-bit, `Uint<3>` → 192-bit, …).
+    ///
+    /// `Some(bytes)`: pin `q` to the prime whose little-endian
+    /// transcription bytes these are (must be exactly `Fmod::NUM_BYTES`
+    /// long). Only for arithmetizations whose constraints are identities
+    /// modulo that specific prime (the SHA+ECDSA demo pins
+    /// [`fixed_prime::SECP256K1_P_LE_BYTES`]); see `fixed_prime` for the
+    /// soundness caveat.
+    const FIXED_PROJECTING_PRIME: Option<&'static [u8]> = None;
 
     /// Zip+ types for the binary polynomial trace columns.
     /// `CombR` is independent per witness type — sized to fit the
@@ -534,6 +563,21 @@ pub trait FoldedZincTypes<const D: usize, const HALF_D: usize>: Clone + Debug {
 
     type PrimeTest: PrimalityTest<Self::Fmod>;
 
+    /// The projecting prime `q` of Step 1 (`\phi_q : Z[X] -> F_q[X]`).
+    ///
+    /// `None` (the default): `q` is drawn from the Fiat–Shamir transcript
+    /// after the witness commitments — the sound, general behaviour. The
+    /// prime has exactly `8 · Fmod::NUM_BYTES` bits, so `Fmod` sizes it
+    /// (`Uint<2>` → 128-bit, `Uint<3>` → 192-bit, …).
+    ///
+    /// `Some(bytes)`: pin `q` to the prime whose little-endian
+    /// transcription bytes these are (must be exactly `Fmod::NUM_BYTES`
+    /// long). Only for arithmetizations whose constraints are identities
+    /// modulo that specific prime (the SHA+ECDSA demo pins
+    /// [`fixed_prime::SECP256K1_P_LE_BYTES`]); see `fixed_prime` for the
+    /// soundness caveat.
+    const FIXED_PROJECTING_PRIME: Option<&'static [u8]> = None;
+
     /// Zip+ types for the **split** binary trace columns.
     /// `Eval = BinaryPoly<HALF_D>` — one round of 2× folding.
     /// `CombR` is independent per witness type.
@@ -589,6 +633,21 @@ pub trait IntFoldedZincTypes<
     type Fmod: ConstIntSemiring + ConstTranscribable + Named;
     type PrimeTest: PrimalityTest<Self::Fmod>;
 
+    /// The projecting prime `q` of Step 1 (`\phi_q : Z[X] -> F_q[X]`).
+    ///
+    /// `None` (the default): `q` is drawn from the Fiat–Shamir transcript
+    /// after the witness commitments — the sound, general behaviour. The
+    /// prime has exactly `8 · Fmod::NUM_BYTES` bits, so `Fmod` sizes it
+    /// (`Uint<2>` → 128-bit, `Uint<3>` → 192-bit, …).
+    ///
+    /// `Some(bytes)`: pin `q` to the prime whose little-endian
+    /// transcription bytes these are (must be exactly `Fmod::NUM_BYTES`
+    /// long). Only for arithmetizations whose constraints are identities
+    /// modulo that specific prime (the SHA+ECDSA demo pins
+    /// [`fixed_prime::SECP256K1_P_LE_BYTES`]); see `fixed_prime` for the
+    /// soundness caveat.
+    const FIXED_PROJECTING_PRIME: Option<&'static [u8]> = None;
+
     /// Zip+ types for the split binary trace columns
     /// (`Eval = BinaryPoly<HALF_D>`).
     type BinaryZt: ZipTypes<
@@ -642,6 +701,21 @@ pub trait IntFoldedZincTypes4x<
     type Pt: ConstIntRing;
     type Fmod: ConstIntSemiring + ConstTranscribable + Named;
     type PrimeTest: PrimalityTest<Self::Fmod>;
+
+    /// The projecting prime `q` of Step 1 (`\phi_q : Z[X] -> F_q[X]`).
+    ///
+    /// `None` (the default): `q` is drawn from the Fiat–Shamir transcript
+    /// after the witness commitments — the sound, general behaviour. The
+    /// prime has exactly `8 · Fmod::NUM_BYTES` bits, so `Fmod` sizes it
+    /// (`Uint<2>` → 128-bit, `Uint<3>` → 192-bit, …).
+    ///
+    /// `Some(bytes)`: pin `q` to the prime whose little-endian
+    /// transcription bytes these are (must be exactly `Fmod::NUM_BYTES`
+    /// long). Only for arithmetizations whose constraints are identities
+    /// modulo that specific prime (the SHA+ECDSA demo pins
+    /// [`fixed_prime::SECP256K1_P_LE_BYTES`]); see `fixed_prime` for the
+    /// soundness caveat.
+    const FIXED_PROJECTING_PRIME: Option<&'static [u8]> = None;
 
     type BinaryZt: ZipTypes<
             Eval = BinaryPoly<QUARTER_D>,
@@ -924,12 +998,13 @@ where
 
 /// 4× int-fold lifted-eval helper. Produces 4-coeff bar_us per int
 /// column: `[q0_eval, q1_eval, q2_eval, q3_eval]` where each coeff is
-/// the MLE eval at `point` of the corresponding 64-bit quarter.
+/// the MLE eval at `point` of the corresponding radix-`R` quarter,
+/// `R = 2^(64·(Q−1))`.
 ///
-/// `q_0, q_1, q_2` are zero-extended single source limbs (always
-/// non-negative); `q_3` is `(v >> 192).resize()` (signed). The original
-/// column's lifted eval at `point` is recoverable as
-/// `c[0] + 2^64·c[1] + 2^128·c[2] + 2^192·c[3]` in F.
+/// `q_0, q_1, q_2` are zero-extended `(Q−1)`-word source chunks (always
+/// non-negative); `q_3` is `(v >> 3·log R).resize()` (signed). The
+/// original column's lifted eval at `point` is recoverable as
+/// `c[0] + R·c[1] + R²·c[2] + R³·c[3]` in F.
 ///
 /// Two fast-paths shave most of the per-cell cost on traces with
 /// many small/zero int values (SHA carries):
@@ -953,7 +1028,10 @@ where
 {
     use crypto_primitives::crypto_bigint_int::Int;
     assert!(Q >= 2);
-    assert!(H >= 4);
+    let w = Q - 1; // words per quarter; radix = 2^(64·w). w = 1 is the
+    // original 64-bit quartering with its u64 fast paths.
+    assert!(H > 3 * w);
+    let shift3: u32 = (192 * w) as u32;
     let eq_table = zinc_poly::utils::build_eq_x_r_vec(point, field_cfg)
         .expect("compute_int_fold_4x_lifted_evals: eq table build failed");
     let zero = F::zero_with_cfg(field_cfg);
@@ -968,33 +1046,45 @@ where
                 let words = entry.as_uint().to_words();
                 let eq_b = &eq_table[b];
 
-                // q_0..q_2: unsigned single-limb lift via u64 fast-path,
-                // skipping the multiply when the limb is zero.
-                if words[0] != 0 {
-                    let mut t = F::from_with_cfg(words[0], field_cfg);
-                    t *= eq_b;
-                    q0_eval += &t;
-                }
-                if words[1] != 0 {
-                    let mut t = F::from_with_cfg(words[1], field_cfg);
-                    t *= eq_b;
-                    q1_eval += &t;
-                }
-                if words[2] != 0 {
-                    let mut t = F::from_with_cfg(words[2], field_cfg);
-                    t *= eq_b;
-                    q2_eval += &t;
+                if w == 1 {
+                    // q_0..q_2: unsigned single-limb lift via u64 fast-path,
+                    // skipping the multiply when the limb is zero.
+                    if words[0] != 0 {
+                        let mut t = F::from_with_cfg(words[0], field_cfg);
+                        t *= eq_b;
+                        q0_eval += &t;
+                    }
+                    if words[1] != 0 {
+                        let mut t = F::from_with_cfg(words[1], field_cfg);
+                        t *= eq_b;
+                        q1_eval += &t;
+                    }
+                    if words[2] != 0 {
+                        let mut t = F::from_with_cfg(words[2], field_cfg);
+                        t *= eq_b;
+                        q2_eval += &t;
+                    }
+                } else {
+                    // q_0..q_2: unsigned (Q−1)-word chunks, zero-skipped.
+                    for (k, acc) in
+                        [&mut q0_eval, &mut q1_eval, &mut q2_eval].into_iter().enumerate()
+                    {
+                        let chunk = &words[k * w..(k + 1) * w];
+                        if chunk.iter().any(|&x| x != 0) {
+                            let mut cw = [0u64; Q];
+                            cw[..w].copy_from_slice(chunk);
+                            let v = Int::<Q>::from_words(cw);
+                            let mut t = F::from_with_cfg(&v, field_cfg);
+                            t *= eq_b;
+                            *acc += &t;
+                        }
+                    }
                 }
 
-                // q_3: signed arithmetic shift; check zero on both
-                // limbs of the resulting Int<2> bit pattern. For
-                // non-negative source values < 2^192, both limbs are
-                // zero and we skip the multiply entirely.
-                let q3_words = (*entry >> 192_u32).as_uint().to_words();
-                let q3_lo = q3_words[0];
-                let q3_hi = if Q >= 2 { q3_words[1] } else { 0 };
-                if q3_lo != 0 || q3_hi != 0 {
-                    let q3_v: Int<Q> = (*entry >> 192_u32).resize();
+                // q_3: signed arithmetic shift; skip the lift when the
+                // shifted value is zero (non-negative v < radix³).
+                let q3_v: Int<Q> = (*entry >> shift3).resize();
+                if q3_v.as_uint().to_words().iter().any(|&x| x != 0) {
                     let mut t = F::from_with_cfg(&q3_v, field_cfg);
                     t *= eq_b;
                     q3_eval += &t;
@@ -1028,6 +1118,9 @@ where
 mod tests {
     use super::*;
     use crypto_bigint::U64;
+    use crypto_primitives::FromPrimitiveWithConfig;
+    use num_traits::Zero;
+    use zinc_utils::{inner_transparent_field::InnerTransparentField, mul_by_scalar::MulByScalar};
     use crypto_primitives::{
         Field, crypto_bigint_int::Int, crypto_bigint_monty::MontyField, crypto_bigint_uint::Uint,
     };
@@ -1048,6 +1141,7 @@ mod tests {
         SUDOKU_SWAPPED, SUDOKU_UNSELECTED, SudokuSelectedUair, sudoku_selections,
         RANGED_BOTH, RANGED_DUPLICATE, RANGED_GRID_ONLY, RANGED_OVER_WIDTH, RANGED_SOLVED,
         SUDOKU_COLS, SudokuRangedUair,
+        IntLookup16OutOfRangeUair, IntLookup16Uair, MixedBinIntLookupUair,
         BitOpRotUair, BrokenPointerHopUair, EC_FP_INT_LIMBS, GenerateRandomTrace,
         POINTER_HOP_NUM_VARS, PointerHopUair, Sha256CompressionSliceUair, Sha256Ideal,
         ShaEcdsaUair, TestUairMixedDegrees, TestUairMixedShifts, TestUairNoMultiplication,
@@ -1060,6 +1154,7 @@ mod tests {
     };
     use zinc_utils::{
         CHECKED,
+        field::runtime_monty::Fp,
         from_ref::FromRef,
         inner_product::{MBSInnerProduct, ScalarProduct},
         projectable_to_field::ProjectableToField,
@@ -1098,19 +1193,18 @@ mod tests {
         4
     };
 
-    /// Number of column openings the PCS performs. Tied to `REP`: rate 1/4
-    /// uses 150 openings, rate 1/8 uses 100, rate 1/16 uses 75 (lower opening
-    /// count is sound at the higher inverse rate because each column reveals
-    /// more information about the codeword).
-    const NUM_COL_OPENINGS_FOR_REP: usize = if cfg!(feature = "iprs-rate-1-16") {
-        75
-    } else if cfg!(feature = "iprs-rate-1-8") {
-        100
-    } else {
-        150
-    };
+    /// Number of column openings the PCS performs for `crate::SECURITY_BITS`
+    /// bits at rate `1/REP` (150 / 100 / 75 at 100 bits for rates 1/4, 1/8,
+    /// 1/16; see `zip_plus::pcs::structs::num_column_openings`).
+    const NUM_COL_OPENINGS_FOR_REP: usize =
+        zip_plus::pcs::structs::num_column_openings(REP, crate::SECURITY_BITS);
 
-    type F = MontyField<FIELD_LIMBS>;
+    // Value-sized field with the modulus installed once into `ProofSlot`
+    // (drop-in for `MontyField<FIELD_LIMBS>`; see utils/src/field/runtime_monty.rs).
+    // `F::make_cfg` (called via `secp256k1_field_cfg`) installs the slot before
+    // any field arithmetic runs.
+    zinc_utils::define_modulus!(ProofSlot, FIELD_LIMBS);
+    type F = Fp<ProofSlot, FIELD_LIMBS>;
 
     #[derive(Debug, Clone)]
     pub struct BinPolyZipTypes {}
@@ -1204,10 +1298,108 @@ mod tests {
         type ArrCombRDotChal = MBSInnerProduct;
     }
 
+    // ── Transcript-drawn 128-bit projecting prime ─────────────────────────
+    //
+    // The sound, general Step-1 behaviour (`FIXED_PROJECTING_PRIME = None`):
+    // the prime is a 128-bit Fiat–Shamir draw, so it differs per proof and
+    // the slot is re-installed each time. That is why this bundle gets its
+    // own slot: every other test pins secp256k1 into `ProofSlot`, and tests
+    // run in parallel threads.
+    const FIELD_LIMBS_128: usize = U64::LIMBS * 2;
+    zinc_utils::define_modulus!(RandomPrimeSlot, FIELD_LIMBS_128);
+    type F128 = Fp<RandomPrimeSlot, FIELD_LIMBS_128>;
+
+    #[derive(Debug, Clone)]
+    pub struct BinPolyZipTypes128 {}
+    impl ZipTypes for BinPolyZipTypes128 {
+        const NUM_COLUMN_OPENINGS: usize = NUM_COL_OPENINGS_FOR_REP;
+        type Eval = BinaryPoly<DEGREE_PLUS_ONE>;
+        type Cw = DensePolynomial<i64, DEGREE_PLUS_ONE>;
+        type Fmod = Uint<FIELD_LIMBS_128>;
+        type PrimeTest = MillerRabin;
+        type Chal = i128;
+        type Pt = i128;
+        type CombR = Int<M>;
+        type Comb = DensePolynomial<Self::CombR, DEGREE_PLUS_ONE>;
+        type EvalDotChal = BinaryPolyInnerProduct<Self::Chal, DEGREE_PLUS_ONE>;
+        type CombDotChal = DensePolyInnerProduct<
+            Self::CombR,
+            Self::Chal,
+            Self::CombR,
+            MBSInnerProduct,
+            DEGREE_PLUS_ONE,
+        >;
+        type ArrCombRDotChal = MBSInnerProduct;
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct ArbitraryPolyZipTypesIprs128 {}
+    impl ZipTypes for ArbitraryPolyZipTypesIprs128 {
+        const NUM_COLUMN_OPENINGS: usize = NUM_COL_OPENINGS_FOR_REP;
+        type Eval = DensePolynomial<i64, DEGREE_PLUS_ONE>;
+        type Cw = DensePolynomial<i64, DEGREE_PLUS_ONE>;
+        type Fmod = Uint<FIELD_LIMBS_128>;
+        type PrimeTest = MillerRabin;
+        type Chal = i128;
+        type Pt = i128;
+        type CombR = Int<M>;
+        type Comb = DensePolynomial<Self::CombR, DEGREE_PLUS_ONE>;
+        type EvalDotChal =
+            DensePolyInnerProduct<i64, Self::Chal, Self::CombR, MBSInnerProduct, DEGREE_PLUS_ONE>;
+        type CombDotChal = DensePolyInnerProduct<
+            Self::CombR,
+            Self::Chal,
+            Self::CombR,
+            MBSInnerProduct,
+            DEGREE_PLUS_ONE,
+        >;
+        type ArrCombRDotChal = MBSInnerProduct;
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct IntZipTypes128 {}
+    impl ZipTypes for IntZipTypes128 {
+        const NUM_COLUMN_OPENINGS: usize = NUM_COL_OPENINGS_FOR_REP;
+        type Eval = ZtInt;
+        type Cw = i128;
+        type Fmod = Uint<FIELD_LIMBS_128>;
+        type PrimeTest = MillerRabin;
+        type Chal = i128;
+        type Pt = i128;
+        type CombR = Int<M>;
+        type Comb = Self::CombR;
+        type EvalDotChal = ScalarProduct;
+        type CombDotChal = ScalarProduct;
+        type ArrCombRDotChal = MBSInnerProduct;
+    }
+
+    /// IPRS bundle with a transcript-drawn 128-bit projecting prime
+    /// (`FIXED_PROJECTING_PRIME` left at its `None` default).
+    #[derive(Clone, Debug)]
+    struct TestZincTypesIprs128;
+
+    impl ZincTypes<DEGREE_PLUS_ONE> for TestZincTypesIprs128 {
+        type Int = ZtInt;
+        type Chal = i128;
+        type Pt = i128;
+        type Fmod = Uint<FIELD_LIMBS_128>;
+        type PrimeTest = MillerRabin;
+
+        type BinaryZt = BinPolyZipTypes128;
+        type ArbitraryZt = ArbitraryPolyZipTypesIprs128;
+        type IntZt = IntZipTypes128;
+
+        type BinaryLc = IprsCode<Self::BinaryZt, PnttConfigF65537, REP, CHECKED>;
+        type ArbitraryLc = IprsCode<Self::ArbitraryZt, PnttConfigF65537, REP, CHECKED>;
+        type IntLc = IprsCode<Self::IntZt, PnttConfigF65537, REP, CHECKED>;
+    }
+
     #[derive(Clone, Debug)]
     struct TestZincTypesIprs;
 
     impl ZincTypes<DEGREE_PLUS_ONE> for TestZincTypesIprs {
+        const FIXED_PROJECTING_PRIME: Option<&'static [u8]> =
+            Some(&crate::fixed_prime::SECP256K1_P_LE_BYTES);
         type Int = ZtInt;
         type Chal = i128;
         type Pt = i128;
@@ -1234,6 +1426,8 @@ mod tests {
     struct TestZincTypesRaa;
 
     impl ZincTypes<DEGREE_PLUS_ONE> for TestZincTypesRaa {
+        const FIXED_PROJECTING_PRIME: Option<&'static [u8]> =
+            Some(&crate::fixed_prime::SECP256K1_P_LE_BYTES);
         type Int = i64;
         type Chal = i128;
         type Pt = i128;
@@ -1312,6 +1506,51 @@ mod tests {
         <F as Field>::Inner: FromRef<Zt::Fmod>,
         <F as Field>::Modulus: FromRef<Zt::Fmod>,
     {
+        do_test_with_field::<Zt, U, F>(num_vars, linear_codes, project_ideal, tamper, check_verification)
+    }
+
+    /// `do_test` generic over the projecting field `Fq` (so a bundle whose
+    /// prime is transcript-drawn into its own slot can reuse the harness).
+    #[allow(clippy::result_large_err)]
+    fn do_test_with_field<Zt, U, Fq>(
+        num_vars: usize,
+        linear_codes: (Zt::BinaryLc, Zt::ArbitraryLc, Zt::IntLc),
+        project_ideal: impl Fn(
+            &IdealOrZero<U::Ideal>,
+            &<Fq as PrimeField>::Config,
+        ) -> IdealOrZero<DegreeOneIdeal<Fq>>
+        + Copy,
+        tamper: impl Fn(&mut Proof<Fq>),
+        check_verification: impl Fn(Result<(), ProtocolError<Fq, IdealOrZero<DegreeOneIdeal<Fq>>>>),
+    ) where
+        Zt: ZincTypes<DEGREE_PLUS_ONE>,
+        Zt::Int: num_traits::Zero,
+        <Zt::BinaryZt as ZipTypes>::Cw: ProjectableToField<Fq>,
+        <Zt::ArbitraryZt as ZipTypes>::Eval: ProjectableToField<Fq>,
+        <Zt::ArbitraryZt as ZipTypes>::Cw: ProjectableToField<Fq>,
+        <Zt::IntZt as ZipTypes>::Cw: ProjectableToField<Fq>,
+        U: Uair<Scalar = DensePolynomial<Zt::Int, DEGREE_PLUS_ONE>>
+            + GenerateRandomTrace<DEGREE_PLUS_ONE, PolyCoeff = Zt::Int, Int = Zt::Int>
+            + 'static,
+        Fq: for<'a> FromWithConfig<&'a Zt::Int>
+            + for<'a> FromWithConfig<&'a <Zt::BinaryZt as ZipTypes>::CombR>
+            + for<'a> FromWithConfig<&'a <Zt::ArbitraryZt as ZipTypes>::CombR>
+            + for<'a> FromWithConfig<&'a <Zt::IntZt as ZipTypes>::CombR>
+            + for<'a> FromWithConfig<&'a Zt::Chal>
+            + for<'a> FromWithConfig<&'a Zt::Pt>,
+        <Fq as Field>::Inner: FromRef<Zt::Fmod>,
+        <Fq as Field>::Modulus: FromRef<Zt::Fmod>,
+        Fq: InnerTransparentField
+            + FromPrimitiveWithConfig
+            + for<'a> MulByScalar<&'a Fq>
+            + FromRef<Fq>
+            + Send
+            + Sync
+            + 'static,
+        <Fq as Field>::Inner: ConstIntSemiring + ConstTranscribable + Send + Sync + Zero + Default,
+        <Fq as Field>::Modulus: ConstTranscribable,
+        Zt::Int: ProjectableToField<Fq>,
+    {
         let mut rng = rng();
         let pp = setup_pp::<Zt>(num_vars, linear_codes);
 
@@ -1322,7 +1561,7 @@ mod tests {
 
         macro_rules! run_protocol {
             ($mle_first:ident) => {
-                let mut proof = ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::prove::<
+                let mut proof = ZincPlusPiop::<Zt, U, Fq, DEGREE_PLUS_ONE>::prove::<
                     { $mle_first },
                     CHECKED,
                 >(&pp, &trace, num_vars, project_scalar_fn)
@@ -1340,7 +1579,7 @@ mod tests {
                 tamper(&mut proof);
 
                 let verification_result =
-                    ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
+                    ZincPlusPiop::<Zt, U, Fq, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
                         &pp,
                         proof,
                         &public_trace,
@@ -2681,6 +2920,110 @@ mod tests {
         );
     }
 
+    /// End-to-end test of the `Word`-table (integer range-check) lookup:
+    /// 4 witness int columns holding 16-bit values, all declared
+    /// `Word { width: 16 }`. Exercises `prove_group_int` / `verify_group_int`,
+    /// the int multipoint reducer (two claims: r_inner + r_0) and the single
+    /// int Zip+ open at its reduced point, plus proof serialization.
+    #[test]
+    fn test_e2e_int_lookup16() {
+        let num_vars = 8;
+        do_test::<TestZincTypesIprs, IntLookup16Uair<ZtInt>>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+            |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
+            |_| {},
+            |res| res.unwrap(),
+        );
+    }
+
+    /// A `Word`-table lookup on a subset of the int columns (one column is
+    /// NOT range-checked, so its `r_inner` eval goes through the non-parent
+    /// path) together with a `BitPoly` lookup on binary_poly columns — both
+    /// reducers run in one proof.
+    #[test]
+    fn test_e2e_mixed_bin_int_lookup() {
+        let num_vars = 8;
+        do_test::<TestZincTypesIprs, MixedBinIntLookupUair<ZtInt>>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+            |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
+            |_| {},
+            |res| res.unwrap(),
+        );
+    }
+
+    /// Negative tests for the int range check: a tampered per-column eval
+    /// at `r_inner` (the lookup's own lift) and a tampered eval at the int
+    /// reducer's `r*` must both be rejected.
+    #[test]
+    fn test_e2e_int_lookup16_tampered_rejected() {
+        let num_vars = 8;
+        do_test::<TestZincTypesIprs, IntLookup16Uair<ZtInt>>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+            |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
+            |proof| {
+                let g = &mut proof.lookup_proof.groups[0];
+                let e = g.chunk_lifts[0][1].coeffs.first().cloned().unwrap_or_else(F::zero);
+                g.chunk_lifts[0][1] = DynamicPolynomialF::new_trimmed(vec![e + F::one()]);
+                g.int_evals_at_r_inner[1] = g.int_evals_at_r_inner[1] + F::one();
+            },
+            |res| assert!(res.is_err(), "tampered r_inner eval must be rejected"),
+        );
+        do_test::<TestZincTypesIprs, IntLookup16Uair<ZtInt>>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+            |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
+            |proof| {
+                proof.int_evals_at_r_star[2] = proof.int_evals_at_r_star[2] + F::one();
+            },
+            |res| assert!(res.is_err(), "tampered r* eval must be rejected"),
+        );
+    }
+
+    /// The prover refuses a witness with a cell outside the declared range
+    /// (`Word { width: 16 }` with a value of `2^16`): the range check is
+    /// not something an honest-looking proof can be produced for.
+    #[test]
+    fn test_e2e_int_lookup16_out_of_range_witness_rejected() {
+        let num_vars = 6;
+        let pp = setup_pp::<TestZincTypesIprs>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+        );
+        let mut rng = rng();
+        let trace = IntLookup16OutOfRangeUair::<ZtInt>::generate_random_trace(num_vars, &mut rng);
+        let res = ZincPlusPiop::<TestZincTypesIprs, IntLookup16OutOfRangeUair<ZtInt>, F, DEGREE_PLUS_ONE>::prove::<
+            false,
+            CHECKED,
+        >(&pp, &trace, num_vars, project_scalar_fn);
+        assert!(
+            matches!(res, Err(ProtocolError::Lookup(LookupError::WitnessNotInTable))),
+            "an out-of-range int cell must make the prover fail with WitnessNotInTable, got {res:?}"
+        );
+    }
+
     /// Opt-in A/B benchmark isolating the GKR-LogUp lookup cost: the
     /// lookup-bearing BinLookup16 UAIRs (G=1 fast path, G=2 reducer path)
     /// vs the no-lookup control with the identical 16-column layout.
@@ -2875,6 +3218,50 @@ mod tests {
             default_project_ideal!(),
             |_| {},
             |res| res.unwrap(),
+        );
+    }
+
+    /// End-to-end test of the transcript-drawn projecting prime
+    /// (`FIXED_PROJECTING_PRIME = None`, 128-bit `Fmod = Uint<2>`): the
+    /// prover draws `q` from the transcript after step 0, the verifier
+    /// re-derives it, and the value-sized field slot is re-installed per
+    /// proof. Runs two ideal-bearing UAIRs (binary+int lanes) honestly,
+    /// then checks that a tampered lifted eval is rejected.
+    /// All three runs live in ONE test because they share
+    /// `RandomPrimeSlot` and a slot must not be re-installed concurrently.
+    #[test]
+    fn test_e2e_random_projecting_prime_128() {
+        let num_vars = 8;
+        let codes = || {
+            (
+                make_iprs::<BinPolyZipTypes128>(num_vars),
+                make_iprs::<ArbitraryPolyZipTypesIprs128>(num_vars),
+                make_iprs::<IntZipTypes128>(num_vars),
+            )
+        };
+        do_test_with_field::<TestZincTypesIprs128, BigLinearUair<ZtInt>, F128>(
+            num_vars,
+            codes(),
+            default_project_ideal!(),
+            |_| {},
+            |res| res.unwrap(),
+        );
+        do_test_with_field::<TestZincTypesIprs128, BinaryDecompositionUair<ZtInt>, F128>(
+            num_vars,
+            codes(),
+            default_project_ideal!(),
+            |_| {},
+            |res| res.unwrap(),
+        );
+        do_test_with_field::<TestZincTypesIprs128, BigLinearUair<ZtInt>, F128>(
+            num_vars,
+            codes(),
+            default_project_ideal!(),
+            |proof| {
+                let c = &mut proof.witness_lifted_evals[0].coeffs[0];
+                *c = c.clone() + c.clone() + F128::one_with_cfg(&());
+            },
+            |res| assert!(res.is_err(), "tampered lifted eval must be rejected"),
         );
     }
 
@@ -3268,6 +3655,8 @@ mod tests {
             INT_QUARTER_LIMBS_TEST,
         > for TestShaEcdsaFolded4xZincTypes
     {
+        const FIXED_PROJECTING_PRIME: Option<&'static [u8]> =
+            Some(&crate::fixed_prime::SECP256K1_P_LE_BYTES);
         type Chal = i128;
         type Pt = i128;
         type Fmod = Uint<FIELD_LIMBS>;
@@ -3355,6 +3744,8 @@ mod tests {
     struct TestShaEcdsaZincTypes;
 
     impl ZincTypes<DEGREE_PLUS_ONE> for TestShaEcdsaZincTypes {
+        const FIXED_PROJECTING_PRIME: Option<&'static [u8]> =
+            Some(&crate::fixed_prime::SECP256K1_P_LE_BYTES);
         type Int = ShaEcdsaInt;
         type Chal = i128;
         type Pt = i128;
@@ -3706,6 +4097,8 @@ mod tests {
     struct TestFoldedZincTypesIprs;
 
     impl FoldedZincTypes<DEGREE_PLUS_ONE, HALF_DEGREE_PLUS_ONE> for TestFoldedZincTypesIprs {
+        const FIXED_PROJECTING_PRIME: Option<&'static [u8]> =
+            Some(&crate::fixed_prime::SECP256K1_P_LE_BYTES);
         type Int = ZtInt;
         type Chal = i128;
         type Pt = i128;

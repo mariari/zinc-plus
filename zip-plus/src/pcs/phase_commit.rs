@@ -460,8 +460,11 @@ mod tests {
         let results: Vec<Vec<Vec<Int<4>>>> = (0..10)
             .into_par_iter()
             .map(|_| {
-                let row_len = 1 << (num_vars / 2);
-                let pp = ZipPlusParams::new(num_vars, poly_size / row_len, C.clone());
+                // The matrix geometry must follow the code's row length
+                // (`setup` derives `num_rows` from it); a mismatched
+                // `num_rows` leaves rows of the encoded matrix
+                // uninitialized.
+                let pp = TestZip::setup(poly_size, C.clone());
 
                 let rows = TestZip::encode_rows(&pp, &poly.evaluations);
                 let rows: Vec<Vec<_>> = rows

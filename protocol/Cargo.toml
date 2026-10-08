@@ -36,7 +36,14 @@ workspace = true
 
 
 [features]
-parallel = ["dep:rayon", "zinc-piop/parallel", "zinc-poly/parallel", "zinc-uair/parallel", "zinc-utils/parallel"]
+parallel = [
+    "dep:rayon",
+    "zinc-piop/parallel",
+    "zinc-poly/parallel",
+    "zinc-uair/parallel",
+    "zinc-utils/parallel",
+    "zip-plus/parallel",
+]
 simd = ["zinc-poly/simd", "zinc-piop/simd", "zip-plus/simd"]
 unchecked = []
 # Switch the IPRS bench code from inverse-rate 4 (rate 1/4) to inverse-rate 8
@@ -45,7 +52,18 @@ iprs-rate-1-8 = []
 # Switch the IPRS bench code to inverse-rate 16 (rate 1/16). Takes precedence
 # over `iprs-rate-1-8` if both are enabled.
 iprs-rate-1-16 = []
+# Target security level of the tests/benches (default 100 bits). Sets the
+# number of Zip+ column openings for the chosen rate (see
+# `zip_plus::pcs::structs::num_column_openings`) and, in the benches that
+# draw the projecting prime from the transcript, the prime's width.
+# `sec-128` takes precedence over `sec-114` if both are enabled.
+sec-114 = []
+sec-128 = []
 
 [[bench]]
 name = "e2e"
+harness = false
+
+[[bench]]
+name = "limber_multiswap"
 harness = false

@@ -46,24 +46,91 @@ where
 
     let mut output = base_multiply_into_output::<_, _, _, CHECK>(input, params, mul_in_by_twiddle);
 
-    combine_stages::<_, _, CHECK>(&mut output, params, mul_out_by_twiddle);
+    combine_stages::<_, _, CHECK>(&mut output, params, 0..params.depth, mul_out_by_twiddle);
 
     output
 }
 
-/// Performs the butterfly steps of the radix-8 pseudo NTT algorithm.
-/// Assumes `out` contains the result of multiplications of the base chunks
-/// with the `base_matrix`.
+/// The radix-8 pseudo NTT with a narrow intermediate type: the base layer
+/// and the first `narrow_stages` butterfly stages run over `Mid`, the
+/// result is widened to `Out` (`Out: FromRef<Mid>`), and the remaining
+/// stages run over `Out`.
+///
+/// The caller is responsible for `Mid` being wide enough: with inputs of
+/// `b` bits and twiddles below `2^15`, the base layer produces values
+/// below `2^(b + 15 + log2(base_len))` and each radix-8 stage multiplies
+/// the bound by `1 + 7 · 2^15 < 2^18`. Under `CHECK` every operation is
+/// overflow-checked, so a too-narrow `Mid` panics instead of wrapping.
+pub(crate) fn pntt_widening<In, Mid, Out, C, const CHECK: bool>(
+    input: &[In],
+    params: &Radix8PnttParams<C>,
+    narrow_stages: usize,
+    mul_in_by_twiddle: impl Fn(&In, &PnttInt) -> Mid + Copy + Sync,
+    mul_mid_by_twiddle: impl Fn(&Mid, &PnttInt) -> Mid + Copy + Sync,
+    mul_out_by_twiddle: impl Fn(&Out, &PnttInt) -> Out + Copy + Sync,
+) -> Vec<Out>
+where
+    C: Config,
+    In: Clone + Send + Sync,
+    Mid: CheckedAdd
+        + CheckedMul
+        + FromRef<In>
+        + Clone
+        + Send
+        + Sync
+        + Debug
+        + for<'a> Add<&'a Mid, Output = Mid>,
+    Out: CheckedAdd
+        + CheckedMul
+        + FromRef<Mid>
+        + Clone
+        + Send
+        + Sync
+        + Debug
+        + for<'a> Add<&'a Out, Output = Out>,
+{
+    assert_eq!(
+        params.row_len,
+        input.len(),
+        "PNTT expects length = {}, got {}",
+        params.row_len,
+        input.len()
+    );
+    assert!(
+        narrow_stages <= params.depth,
+        "narrow_stages ({narrow_stages}) exceeds the depth ({})",
+        params.depth
+    );
+
+    let mut mid = base_multiply_into_output::<_, _, _, CHECK>(input, params, mul_in_by_twiddle);
+    combine_stages::<_, _, CHECK>(&mut mid, params, 0..narrow_stages, mul_mid_by_twiddle);
+
+    let mut output: Vec<Out> = cfg_into_iter!(mid).map(|v| Out::from_ref(&v)).collect();
+    combine_stages::<_, _, CHECK>(
+        &mut output,
+        params,
+        narrow_stages..params.depth,
+        mul_out_by_twiddle,
+    );
+
+    output
+}
+
+/// Performs the butterfly stages `stages` (a sub-range of
+/// `0..params.depth`) of the radix-8 pseudo NTT algorithm. Assumes `out`
+/// contains the result of multiplications of the base chunks with the
+/// `base_matrix` and of every stage before `stages.start`.
 #[allow(clippy::arithmetic_side_effects)]
 fn combine_stages<R, C, const CHECK: bool>(
     out: &mut [R],
     params: &Radix8PnttParams<C>,
+    stages: std::ops::Range<usize>,
     mul_by_twiddle: impl Fn(&R, &PnttInt) -> R + Copy + Sync,
 ) where
     C: Config,
     R: CheckedAdd + CheckedMul + for<'a> Add<&'a R, Output = R> + Clone + Send + Sync + Debug,
 {
-    for k in 0..params.depth {
+    for k in stages {
         // The length of chunks in the current layer.
         let sub_chunk_length = params.base_dim * (1 << (3 * k));
 

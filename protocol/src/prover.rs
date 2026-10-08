@@ -20,9 +20,11 @@ use zinc_piop::{
         compute_shifted_bit_slice_evals_streaming, finalize_booleanity_prover,
         prepare_booleanity_group,
     },
+    int_multipoint_reducer::{IntClaim as ReducerIntClaim, IntMultipointReducer},
     lookup::gkr_logup::{
-        BinaryPolyLookupInstance, GkrLogupGroupSubclaim, GkrLogupLookupProof, IntLookupInstance,
-        SelectedLookupInstance, combine_chunks, compute_binary_poly_lifts, prove_group,
+        BinaryPolyLookupInstance, GkrLogupError, GkrLogupGroupSubclaim, GkrLogupLookupProof,
+        IntLookupInstance, SelectedLookupInstance, combine_chunks, compute_binary_poly_lifts,
+        compute_int_column_evals, lift_scalar, prove_group, prove_group_int,
         prove_group_prescribed, prove_group_selected, prove_group_word,
     },
     multipoint_eval::{MultipointEval, Proof as MultipointEvalProof},
@@ -37,16 +39,17 @@ use zinc_poly::{
     mle::MultilinearExtensionWithConfig,
     univariate::dynamic::over_field::DynamicPolynomialF,
 };
-use zinc_transcript::traits::{ConstTranscribable, Transcript};
+use zinc_transcript::traits::{ConstTranscribable, Transcribable, Transcript};
 use zinc_uair::{
     LookupTableType, Uair, UairSignature, UairTrace, constraint_counter::count_constraints,
     degree_counter::count_max_degree,
 };
 use zinc_utils::{
     add, cfg_join, from_ref::FromRef, inner_transparent_field::InnerTransparentField,
-    mul_by_scalar::MulByScalar, projectable_to_field::ProjectableToField,
+    mul_by_scalar::MulByScalar, projectable_to_field::ProjectableToField, sub,
 };
 use zip_plus::{
+    ZipError,
     pcs::{
         ZipPlusProveByteBreakdown,
         multi_zip::MultiZip3,
@@ -233,6 +236,9 @@ pub struct ProverMultipointEvaled<'a, Zt: ZincTypes<D>, U: Uair, F: PrimeField, 
     witness_int_f: Vec<DenseMultilinearExtension<F::Inner>>,
     pointer_query_proof: Option<PointerQueryProof<F>>,
     pq_points: Option<PointerQueryPoints<F>>,
+    /// The ψ_α-projected trace MLEs (built in Step 3), kept for the
+    /// step-7 int multipoint reducer.
+    projected_trace_f: Vec<DenseMultilinearExtension<F::Inner>>,
 
     // New
     mp_proof: MultipointEvalProof<F>,
@@ -253,6 +259,7 @@ pub struct ProverLifted<'a, Zt: ZincTypes<D>, U: Uair, F: PrimeField, const D: u
     witness_int_f: Vec<DenseMultilinearExtension<F::Inner>>,
     pointer_query_proof: Option<PointerQueryProof<F>>,
     pq_points: Option<PointerQueryPoints<F>>,
+    projected_trace_f: Vec<DenseMultilinearExtension<F::Inner>>,
     mp_proof: MultipointEvalProof<F>,
     r_0: Vec<F>,
 
@@ -289,7 +296,7 @@ pub struct ProverPcsOpened<'a, Zt: ZincTypes<D>, U: Uair, F: PrimeField, const D
     bin_reducer_proof: Option<BinReducerProof<F>>,
     bin_lifts_at_r_star: Vec<DynamicPolynomialF<F>>,
     int_reducer_proof: Option<BinReducerProof<F>>,
-    int_lifts_at_r_star: Vec<DynamicPolynomialF<F>>,
+    int_evals_at_r_star: Vec<F>,
     mp_proof: MultipointEvalProof<F>,
     lifted_evals: Vec<DynamicPolynomialF<F>>,
     pointer_query_proof: Option<PointerQueryProof<F>>,
@@ -404,10 +411,13 @@ impl_with_type_bounds!(ProverBase
         project_scalar: S,
     ) -> Result<(F::Config, ScalarMap<U::Scalar, DynamicPolynomialF<F>>), ProtocolError<F, U::Ideal>>
     {
-        // `fixed-prime` branch: use the secp256k1 base field prime as the
-        // projecting prime instead of drawing one from the transcript.
-        // See `crate::fixed_prime` for the soundness caveat.
-        let field_cfg = crate::fixed_prime::secp256k1_field_cfg::<F, Zt::Fmod>();
+        // Step 1: the projecting prime — drawn from the transcript unless
+        // the type bundle pins one (`Zt::FIXED_PROJECTING_PRIME`; see
+        // `crate::fixed_prime` for the soundness caveat of pinning).
+        let field_cfg = crate::fixed_prime::projecting_field_cfg::<F, Zt::Fmod, Zt::PrimeTest, _>(
+            Zt::FIXED_PROJECTING_PRIME,
+            &mut self.pcs_transcript.fs_transcript,
+        );
 
         let projected_scalars_fx = project_scalars::<F, U>(|s| project_scalar(s, &field_cfg));
         Ok((field_cfg, projected_scalars_fx))
@@ -880,6 +890,83 @@ impl_with_type_bounds!(ProverSumchecked
             );
 
             for (table_type, parent_indices) in grouped {
+                // `Word` tables range-check witness **int** columns: one
+                // LogUp instance whose chunks are the columns, plus the
+                // evals of every witness int column at the group's r_inner
+                // (parents from the lookup's own lifts, the rest computed),
+                // discharged by the step-7 int multipoint reducer.
+                if let LookupTableType::Word { .. } = table_type {
+                    let total = self.base.uair_signature.total_cols();
+                    let num_total_bin = total.num_binary_poly_cols();
+                    let num_total_arb = total.num_arbitrary_poly_cols();
+                    let num_pub_int = pub_cols.num_int_cols();
+                    let num_wit_int = sub!(total.num_int_cols(), num_pub_int);
+                    let int_offset = add!(add!(num_total_bin, num_total_arb), num_pub_int);
+                    let mut parent_refs = Vec::with_capacity(parent_indices.len());
+                    for &idx in &parent_indices {
+                        if idx < int_offset || idx >= add!(int_offset, num_wit_int) {
+                            return Err(ProtocolError::Lookup(
+                                zinc_piop::lookup::LookupError::NotImplemented,
+                            ));
+                        }
+                        parent_refs.push(&witness_trace.int[sub!(idx, int_offset)]);
+                    }
+                    let instance = IntLookupInstance::<'_, Zt::Int> {
+                        parent_columns: parent_refs,
+                        parent_column_indices: parent_indices.clone(),
+                        table_type,
+                        n_vars: self.base.num_vars,
+                    };
+                    let (mut group_proof, meta, sub) = prove_group_int::<F, Zt::Int>(
+                        &mut self.base.pcs_transcript.fs_transcript,
+                        &instance,
+                        &self.field_cfg,
+                    )
+                    .map_err(|e| {
+                        ProtocolError::Lookup(match e {
+                            GkrLogupError::WitnessNotInTable => {
+                                zinc_piop::lookup::LookupError::WitnessNotInTable
+                            }
+                            _ => zinc_piop::lookup::LookupError::FinalEvaluationMismatch,
+                        })
+                    })?;
+
+                    let zero = F::zero_with_cfg(&self.field_cfg);
+                    let mut evals: Vec<Option<F>> = vec![None; num_wit_int];
+                    for (ell, &col) in sub.parent_columns.iter().enumerate() {
+                        evals[sub!(col, int_offset)] =
+                            Some(lift_scalar(&sub.combined_polynomial[ell], &zero));
+                    }
+                    let non_parent: Vec<usize> =
+                        (0..num_wit_int).filter(|i| evals[*i].is_none()).collect();
+                    if !non_parent.is_empty() {
+                        let cols: Vec<&DenseMultilinearExtension<F::Inner>> = non_parent
+                            .iter()
+                            .map(|&i| &self.projected_trace_f[add!(int_offset, i)])
+                            .collect();
+                        let np_evals =
+                            compute_int_column_evals::<F>(&cols, &sub.r_inner, &self.field_cfg);
+                        for (i, e) in non_parent.into_iter().zip(np_evals) {
+                            evals[i] = Some(e);
+                        }
+                    }
+                    let int_evals: Vec<F> =
+                        evals.into_iter().map(|e| e.expect("every int col filled")).collect();
+                    // Bind the claimed evals into the transcript before the
+                    // step-7 reducer draws its challenges.
+                    let mut buf = vec![0u8; F::Inner::NUM_BYTES];
+                    self.base
+                        .pcs_transcript
+                        .fs_transcript
+                        .absorb_random_field_slice(&int_evals, &mut buf);
+                    group_proof.int_evals_at_r_inner = int_evals;
+
+                    groups.push(group_proof);
+                    group_meta.push(meta);
+                    subclaims.push(sub);
+                    continue;
+                }
+
                 // A group over integer columns is discharged by an extra
                 // int opening at its own r_inner, the way the pointer
                 // query discharges r_A / r_B. One table is one group, and
@@ -1053,6 +1140,16 @@ impl_with_type_bounds!(ProverSumchecked
                     }
                 }
                 group_proof.bin_lifts_at_r_inner = bin_lifts;
+                // Bind every witness bin lift at r_inner (non-parent lifts
+                // are not covered by the chunk_lifts absorption below) before
+                // the step-7 reducer draws its challenges.
+                let mut buf = vec![0u8; F::Inner::NUM_BYTES];
+                for lift in &group_proof.bin_lifts_at_r_inner {
+                    self.base
+                        .pcs_transcript
+                        .fs_transcript
+                        .absorb_random_field_slice(&lift.coeffs, &mut buf);
+                }
 
                 groups.push(group_proof);
                 group_meta.push(meta);
@@ -1245,6 +1342,7 @@ impl_with_type_bounds!(ProverLookupProved
             lookup_r_inners: self.lookup_r_inners,
             pointer_query_proof: self.pointer_query_proof,
             pq_points: self.pq_points,
+            projected_trace_f: self.projected_trace_f,
             mp_proof,
             r_0: mp_prover_state.eval_point,
         })
@@ -1262,11 +1360,32 @@ impl_with_type_bounds!(ProverMultipointEvaled
         // (after \phi_q but before \psi_a). The verifier derives the scalar
         // open_evals via \psi_a for the sumcheck consistency check, and
         // supplies these to the Zip+ PCS for alpha-projection.
-        let lifted_evals = compute_lifted_evals::<F, D>(
+        // Binary / arbitrary-poly columns: polynomial-valued lifts from the
+        // row-major trace. Int columns: their lift is the scalar MLE
+        // evaluation of the projected column, computed on the column-major
+        // F-projected trace (`compute_int_column_evals`, one contiguous
+        // pass per column) instead of walking the row-major trace of
+        // heap-allocated cells column by column.
+        let total = self.base.uair_signature.total_cols();
+        let n_bin = total.num_binary_poly_cols();
+        let n_arb = total.num_arbitrary_poly_cols();
+        let n_int = total.num_int_cols();
+        let mut lifted_evals = compute_lifted_evals_capped::<F, D>(
             &self.r_0,
             &self.base.trace.binary_poly,
             &self.projected_trace,
             &self.field_cfg,
+            Some(n_arb),
+        );
+        let int_start = add!(n_bin, n_arb);
+        let int_cols: Vec<&DenseMultilinearExtension<F::Inner>> = self.projected_trace_f
+            [int_start..add!(int_start, n_int)]
+            .iter()
+            .collect();
+        lifted_evals.extend(
+            compute_int_column_evals::<F>(&int_cols, &self.r_0, &self.field_cfg)
+                .into_iter()
+                .map(|e| DynamicPolynomialF::new_trimmed(vec![e])),
         );
 
         let mut transcription_buf: Vec<u8> = vec![0; F::Inner::NUM_BYTES];
@@ -1358,6 +1477,7 @@ impl_with_type_bounds!(ProverMultipointEvaled
             lookup_r_inners: self.lookup_r_inners,
             pointer_query_proof: self.pointer_query_proof,
             pq_points: self.pq_points,
+            projected_trace_f: self.projected_trace_f,
             mp_proof: self.mp_proof,
             r_0: self.r_0,
             lifted_evals,
@@ -1397,14 +1517,11 @@ impl_with_type_bounds!(ProverLifted
         let num_total_bin = total.num_binary_poly_cols();
         let num_wit_bin = num_total_bin - num_pub_bin;
 
-        // Only groups over binary columns want the bin reducer; a group
-        // over integer columns is discharged by its own int opening, so a
-        // lookup set made only of those leaves the bin side untouched.
         let n_groups = self
             .lookup_proof
             .group_meta
             .iter()
-            .filter(|meta| !meta.table_type.reads_int_columns())
+            .filter(|m| matches!(m.table_type, LookupTableType::BitPoly { .. }))
             .count();
         let (bin_reducer_proof, bin_lifts_at_r_star) = if n_groups == 0
             || self.base.hint_bin.is_none()
@@ -1431,12 +1548,16 @@ impl_with_type_bounds!(ProverLifted
             // Build claim list: G groups + 1 step-7 r_0 claim.
             let mut claims: Vec<ReducerBinClaim<F>> =
                 Vec::with_capacity(self.lookup_proof.groups.len() + 1);
-            for (group, r_inner) in self
+            for ((group, meta), r_inner) in self
                 .lookup_proof
                 .groups
                 .iter()
+                .zip(self.lookup_proof.group_meta.iter())
                 .zip(self.lookup_r_inners.iter())
             {
+                if !matches!(meta.table_type, LookupTableType::BitPoly { .. }) {
+                    continue;
+                }
                 claims.push(ReducerBinClaim {
                     point: r_inner.clone(),
                     lifts: group.bin_lifts_at_r_inner.clone(),
@@ -1470,6 +1591,14 @@ impl_with_type_bounds!(ProverLifted
             let bin_lifts_r_star: Vec<DynamicPolynomialF<F>> =
                 compute_binary_poly_lifts::<F, D>(&cols_ref, &reduced.point, &self.field_cfg);
             assert_eq!(bin_lifts_r_star.len(), num_wit_bin);
+            // Bind the r* lifts before the Zip+ open draws its alphas.
+            let mut buf = vec![0u8; F::Inner::NUM_BYTES];
+            for lift in &bin_lifts_r_star {
+                self.base
+                    .pcs_transcript
+                    .fs_transcript
+                    .absorb_random_field_slice(&lift.coeffs, &mut buf);
+            }
 
             // ONE Zip+ open at r*.
             if let Some(hint_bin) = &self.base.hint_bin {
@@ -1496,102 +1625,100 @@ impl_with_type_bounds!(ProverLifted
                 &self.field_cfg,
             )?;
         }
-        // Int part, the bin part's shape: with no int lookup group the
-        // batch is opened at r_0 directly; with one or more, the reducer
-        // folds every group's r_inner claim together with the r_0 claim
-        // into ONE open at a reduced point r*. That beats a direct open
-        // even at a single group, which would otherwise cost two.
-        let (int_reducer_proof, int_lifts_at_r_star) = match self.int_lookup_points.is_empty() {
-            true => {
-                if let Some(hint_int) = &self.base.hint_int {
-                    let _ = ZipPlus::<Zt::IntZt, Zt::IntLc>::prove_f::<_, CHECK_FOR_OVERFLOW>(
-                        &mut self.base.pcs_transcript,
-                        self.base.pp_int,
-                        &witness_trace.int,
-                        &self.r_0,
-                        hint_int,
-                        &self.field_cfg,
-                    )?;
-                }
-                (None, Vec::new())
-            }
-            false => {
-                let hint_int = self
-                    .base
-                    .hint_int
-                    .as_ref()
-                    .expect("a lookup over int columns requires witness int columns");
-                let witness_int_offset = add!(
-                    add!(num_total_bin, total.num_arbitrary_poly_cols()),
-                    pub_cols.num_int_cols()
-                );
-                let mut claims: Vec<ReducerBinClaim<F>> =
-                    Vec::with_capacity(add!(self.int_lookup_points.len(), 1));
-                for (point, lifts) in self
-                    .int_lookup_points
-                    .iter()
-                    .zip(self.lookup_int_lifted.iter())
-                {
-                    claims.push(ReducerBinClaim {
-                        point: point.clone(),
-                        lifts: lifts.clone(),
-                    });
-                }
-                claims.push(ReducerBinClaim {
-                    point: self.r_0.clone(),
-                    lifts: self.lifted_evals[witness_int_offset..].to_vec(),
+        // Int part: with `Word`-table lookup groups, fold their r_inner
+        // claims and the step-7 r_0 claim into ONE int open at a reduced
+        // point via the int multipoint reducer; otherwise open int at r_0.
+        let int_group_idx: Vec<usize> = self
+            .lookup_proof
+            .group_meta
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(m.table_type, LookupTableType::Word { .. }))
+            .map(|(g, _)| g)
+            .collect();
+        let int_hint_with_groups = match &self.base.hint_int {
+            Some(hint_int) if !int_group_idx.is_empty() => Some(hint_int),
+            _ => None,
+        };
+        let (int_reducer_proof, int_evals_at_r_star) = if let Some(hint_int) = int_hint_with_groups
+        {
+            let num_total_arb = total.num_arbitrary_poly_cols();
+            let num_pub_int = pub_cols.num_int_cols();
+            let int_offset = add!(add!(num_total_bin, num_total_arb), num_pub_int);
+            let num_wit_int = sub!(total.num_int_cols(), num_pub_int);
+            let int_cols_f: &[DenseMultilinearExtension<F::Inner>] =
+                &self.projected_trace_f[int_offset..add!(int_offset, num_wit_int)];
+            let zero = F::zero_with_cfg(&self.field_cfg);
+
+            let mut claims: Vec<ReducerIntClaim<F>> = Vec::with_capacity(add!(int_group_idx.len(), 1));
+            for &g in &int_group_idx {
+                claims.push(ReducerIntClaim {
+                    point: self.lookup_r_inners[g].clone(),
+                    evals: self.lookup_proof.groups[g].int_evals_at_r_inner.clone(),
                 });
+            }
+            let r0_evals: Vec<F> = self.lifted_evals[int_offset..add!(int_offset, num_wit_int)]
+                .iter()
+                .map(|p| lift_scalar(p, &zero))
+                .collect();
+            claims.push(ReducerIntClaim {
+                point: self.r_0.clone(),
+                evals: r0_evals,
+            });
 
-                let (reducer_proof, reduced) = IntMultipointReducer::<F>::prove(
-                    &mut self.base.pcs_transcript.fs_transcript,
-                    &self.witness_int_f,
-                    &claims,
-                    self.base.num_vars,
-                    &self.field_cfg,
-                )
-                .map_err(|_| {
-                    ProtocolError::Lookup(zinc_piop::lookup::LookupError::FinalEvaluationMismatch)
-                })?;
+            let (reducer_proof, reduced) = IntMultipointReducer::<F>::prove(
+                &mut self.base.pcs_transcript.fs_transcript,
+                int_cols_f,
+                &claims,
+                self.base.num_vars,
+                &self.field_cfg,
+            )
+            .map_err(|_| {
+                ProtocolError::Lookup(zinc_piop::lookup::LookupError::FinalEvaluationMismatch)
+            })?;
 
-                let lifts_at_r_star: Vec<DynamicPolynomialF<F>> = self
-                    .witness_int_f
+            let cols_ref: Vec<&DenseMultilinearExtension<F::Inner>> = int_cols_f.iter().collect();
+            let int_evals_r_star =
+                compute_int_column_evals::<F>(&cols_ref, &reduced.point, &self.field_cfg);
+            // Bind the r* evals before the Zip+ open draws its alphas.
+            let mut buf = vec![0u8; F::Inner::NUM_BYTES];
+            self.base
+                .pcs_transcript
+                .fs_transcript
+                .absorb_random_field_slice(&int_evals_r_star, &mut buf);
+
+            open_int_lane::<Zt, F, D, CHECK_FOR_OVERFLOW>(
+                &mut self.base.pcs_transcript,
+                self.base.pp_int,
+                &witness_trace.int,
+                &reduced.point,
+                hint_int,
+                &self.field_cfg,
+                &int_evals_r_star,
+            )?;
+            (Some(reducer_proof), int_evals_r_star)
+        } else {
+            if let Some(hint_int) = &self.base.hint_int {
+                let num_total_arb = total.num_arbitrary_poly_cols();
+                let num_pub_int = pub_cols.num_int_cols();
+                let int_offset = add!(add!(num_total_bin, num_total_arb), num_pub_int);
+                let num_wit_int = sub!(total.num_int_cols(), num_pub_int);
+                let zero = F::zero_with_cfg(&self.field_cfg);
+                let r0_evals: Vec<F> = self.lifted_evals[int_offset..add!(int_offset, num_wit_int)]
                     .iter()
-                    .map(|col| {
-                        DynamicPolynomialF::new_trimmed(vec![
-                            col.clone()
-                                .evaluate_with_config(&reduced.point, &self.field_cfg)
-                                .expect("int col eval at r*"),
-                        ])
-                    })
+                    .map(|p| lift_scalar(p, &zero))
                     .collect();
-
-                #[cfg(test)]
-                crate::test_capture::put(&reduced.gammas_flat);
-
-                // One random weight per integer column, so the batch opening
-                // binds each folded lift and not merely their sum. The
-                // verifier draws the same from its transcript.
-                let per_poly_alphas: Vec<Vec<_>> = self
-                    .base
-                    .pcs_transcript
-                    .fs_transcript
-                    .get_challenges(witness_trace.int.len())
-                    .into_iter()
-                    .map(|a| vec![a])
-                    .collect();
-
-                let _ = ZipPlus::<Zt::IntZt, Zt::IntLc>::prove_f_with_alphas::<_, CHECK_FOR_OVERFLOW>(
+                open_int_lane::<Zt, F, D, CHECK_FOR_OVERFLOW>(
                     &mut self.base.pcs_transcript,
                     self.base.pp_int,
                     &witness_trace.int,
-                    &reduced.point,
+                    &self.r_0,
                     hint_int,
                     &self.field_cfg,
-                    &per_poly_alphas,
+                    &r0_evals,
                 )?;
-
-                (Some(reducer_proof), lifts_at_r_star)
             }
+            (None, Vec::new())
         };
 
         // Pointer query: discharge the endpoint claims with two more
@@ -1639,7 +1766,7 @@ impl_with_type_bounds!(ProverLifted
             bin_reducer_proof,
             bin_lifts_at_r_star,
             int_reducer_proof,
-            int_lifts_at_r_star,
+            int_evals_at_r_star,
             pointer_query_proof: self.pointer_query_proof,
             pq_int_lifted_at_r_a: self.pq_int_lifted_at_r_a,
             lookup_int_lifted: self.lookup_int_lifted,
@@ -1647,6 +1774,43 @@ impl_with_type_bounds!(ProverLifted
         })
     }
 });
+
+/// Opens the int lane at `point`. `evals[j]` must be
+/// `MLE[col_j mod q](point)` (the values the verifier binds the opening
+/// to). With the columns committed as single rows the opening's row sum is
+/// `Σ_j alpha_j · evals[j]`, which `ZipPlus::prove_f_with_evals` uses
+/// directly instead of re-deriving it cell by cell through a wide-integer
+/// → field reduction; other layouts take the generic `prove_f`.
+#[allow(clippy::too_many_arguments)]
+fn open_int_lane<Zt, F, const D: usize, const CHECK_FOR_OVERFLOW: bool>(
+    transcript: &mut PcsProverTranscript,
+    pp: &ZipPlusParams<Zt::IntZt, Zt::IntLc>,
+    polys: &[DenseMultilinearExtension<Zt::Int>],
+    point: &[F],
+    hint: &ZipPlusHint<<Zt::IntZt as ZipTypes>::Cw>,
+    field_cfg: &F::Config,
+    evals: &[F],
+) -> Result<F, ZipError>
+where
+    Zt: ZincTypes<D>,
+    F: PrimeField
+        + for<'b> FromWithConfig<&'b <Zt::IntZt as ZipTypes>::CombR>
+        + for<'b> FromWithConfig<&'b Zt::Chal>
+        + for<'b> MulByScalar<&'b F>
+        + FromRef<F>,
+    F::Inner: Transcribable,
+    F::Modulus: Transcribable,
+{
+    if pp.num_rows == 1 {
+        ZipPlus::<Zt::IntZt, Zt::IntLc>::prove_f_with_evals::<F, CHECK_FOR_OVERFLOW>(
+            transcript, pp, polys, point, hint, field_cfg, evals,
+        )
+    } else {
+        ZipPlus::<Zt::IntZt, Zt::IntLc>::prove_f::<F, CHECK_FOR_OVERFLOW>(
+            transcript, pp, polys, point, hint, field_cfg,
+        )
+    }
+}
 
 impl_with_type_bounds!(ProverPcsOpened
 {
@@ -1693,7 +1857,7 @@ impl_with_type_bounds!(ProverPcsOpened
             bin_reducer_proof: self.bin_reducer_proof,
             bin_lifts_at_r_star: self.bin_lifts_at_r_star,
             int_reducer_proof: self.int_reducer_proof,
-            int_lifts_at_r_star: self.int_lifts_at_r_star,
+            int_evals_at_r_star: self.int_evals_at_r_star,
             pointer_query_proof: self.pointer_query_proof,
             pq_int_lifted_at_r_a: self.pq_int_lifted_at_r_a,
             lookup_int_lifted: self.lookup_int_lifted,
@@ -1912,13 +2076,15 @@ where
     absorb_public_columns(&mut pcs_transcript.fs_transcript, &public_trace.int);
 
     // ── Step 1: Prime projection ────────────────────────────────────────
-    // `fixed-prime` branch: match the non-folded path (see
-    // `ProverCommitted::project_common`) and use the secp256k1 base
-    // prime as the projecting prime instead of drawing one from the
-    // transcript. UAIRs whose constraints are secp256k1-specific
-    // algebraic identities (e.g. `EcdsaUair`) only hold under this
-    // prime, so a random prime here would break verification.
-    let field_cfg = crate::fixed_prime::secp256k1_field_cfg::<F, ZtF::Fmod>();
+    // Match the non-folded path (see `ProverCommitted::project_common`):
+    // draw the projecting prime from the transcript unless the type
+    // bundle pins one. UAIRs whose constraints are secp256k1-specific
+    // algebraic identities (e.g. `EcdsaUair`) only hold under that prime,
+    // so their bundles pin it (`FIXED_PROJECTING_PRIME = Some(secp)`).
+    let field_cfg = crate::fixed_prime::projecting_field_cfg::<F, ZtF::Fmod, ZtF::PrimeTest, _>(
+        ZtF::FIXED_PROJECTING_PRIME,
+        &mut pcs_transcript.fs_transcript,
+    );
     let projected_scalars_fx = project_scalars::<F, U>(|s| project_scalar(s, &field_cfg));
 
     // ── Step 2: Ideal check (lane chosen by MLE_FIRST + UAIR shape) ─────
@@ -2263,7 +2429,7 @@ where
         bin_reducer_proof,
         bin_lifts_at_r_star,
         int_reducer_proof: None,
-        int_lifts_at_r_star: Vec::new(),
+        int_evals_at_r_star: Vec::new(),
         pointer_query_proof: None,
         pq_int_lifted_at_r_a: Vec::new(),
         lookup_int_lifted: Vec::new(),
@@ -2695,7 +2861,10 @@ where
 
     // ── Step 1: Prime projection ────────────────────────────────────────
     let _t_step1 = std::time::Instant::now();
-    let field_cfg = crate::fixed_prime::secp256k1_field_cfg::<F, ZtF::Fmod>();
+    let field_cfg = crate::fixed_prime::projecting_field_cfg::<F, ZtF::Fmod, ZtF::PrimeTest, _>(
+        ZtF::FIXED_PROJECTING_PRIME,
+        &mut pcs_transcript.fs_transcript,
+    );
     let projected_scalars_fx = project_scalars::<F, U>(|s| project_scalar(s, &field_cfg));
     if let Some(t) = timings.as_mut() {
         t.step1_prime_projection = _t_step1.elapsed();
@@ -3159,7 +3328,7 @@ where
         bin_reducer_proof,
         bin_lifts_at_r_star,
         int_reducer_proof: None,
-        int_lifts_at_r_star: Vec::new(),
+        int_evals_at_r_star: Vec::new(),
         pointer_query_proof: None,
         pq_int_lifted_at_r_a: Vec::new(),
         lookup_int_lifted: Vec::new(),
