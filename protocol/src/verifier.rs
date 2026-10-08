@@ -1091,8 +1091,14 @@ where
             sig.public_cols().num_int_cols()
         );
         let num_wit_int = sig.witness_cols().num_int_cols();
+        // The int openings bind only the first coefficient of these lifts; reject longer ones.
         if self.proof_pq_int_lifted_at_r_a.len() != num_wit_int
             || self.proof_pq_int_lifted_at_r_b.len() != num_wit_int
+            || self
+                .proof_pq_int_lifted_at_r_a
+                .iter()
+                .chain(&self.proof_pq_int_lifted_at_r_b)
+                .any(|bar_u| bar_u.coeffs.len() > 1)
         {
             return Err(ProtocolError::PointerQueryLiftedShape);
         }
