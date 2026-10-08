@@ -597,6 +597,8 @@ pub enum ProtocolError<F: SetElement> {
     MultipointEval(#[from] MultipointEvalError<F>),
     #[error("lifted eval psi_a projection failed: {0}")]
     LiftedEvalProjection(PolyEvaluationError),
+    #[error("lifted eval at column {column} has more coefficients than its lane commits")]
+    LiftedEvalDegree { column: usize },
     #[error("lookup argument failed: {0}")]
     Lookup(#[from] LookupError),
     #[error("booleanity argument failed: {0}")]
