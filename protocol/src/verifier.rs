@@ -8,7 +8,7 @@ use zinc_piop::{
     projections::{project_scalars, project_scalars_to_field},
 };
 use zinc_poly::{
-    EvaluatablePolynomial,
+    EvaluatablePolynomial, Polynomial,
     mle::{DenseMultilinearExtension, MultilinearExtensionWithConfig},
     univariate::dynamic::over_field::DynamicPolynomialF,
 };
@@ -138,12 +138,24 @@ where
                 .absorb_random_field_slice(&bar_u.coeffs, &mut transcription_buf);
         }
 
+        // The PCS opening only binds DEGREE_BOUND + 1 coefficients of a lift; reject longer ones.
+        let sig = U::signature();
+        let degree_bound = |column: usize| match column {
+            c if c < sig.binary_poly_cols => <Zt::BinaryZt as ZipTypes>::Comb::DEGREE_BOUND,
+            c if c < add!(sig.binary_poly_cols, sig.arbitrary_poly_cols) => {
+                <Zt::ArbitraryZt as ZipTypes>::Comb::DEGREE_BOUND
+            }
+            _ => <Zt::IntZt as ZipTypes>::Comb::DEGREE_BOUND,
+        };
         for (j, (bar_u, up_eval)) in proof
             .lifted_evals
             .iter()
             .zip(cpr_subclaim.up_evals.iter())
             .enumerate()
         {
+            if bar_u.coeffs.len() > add!(degree_bound(j), 1) {
+                return Err(ProtocolError::LiftedEvalDegree { column: j });
+            }
             let psi_a_val = bar_u
                 .evaluate_at_point(&projecting_element_f)
                 .map_err(ProtocolError::LiftedEvalProjection)?;
@@ -195,7 +207,6 @@ where
             }};
         }
 
-        let sig = U::signature();
         let (n_bin, n_arb, _n_int) = (sig.binary_poly_cols, sig.arbitrary_poly_cols, sig.int_cols);
         verify_pcs_batch!(Zt::BinaryZt, Zt::BinaryLc, vp_bin, 0, [..n_bin]);
         verify_pcs_batch!(

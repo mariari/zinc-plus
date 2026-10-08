@@ -187,6 +187,8 @@ pub enum ProtocolError<F: PrimeField, I: Ideal> {
     },
     #[error("lifted eval ψ_a projection failed: {0}")]
     LiftedEvalProjection(zinc_poly::EvaluationError),
+    #[error("lifted eval at column {column} has more coefficients than its lane commits")]
+    LiftedEvalDegree { column: usize },
     #[error("lifted eval ψ_a mismatch at column {column}: expected {expected:?}, got {actual:?}")]
     LiftedEvalMismatch {
         column: usize,
@@ -656,6 +658,30 @@ mod tests {
         big_linear_verify_tampered(|proof| {
             proof.resolver.down_evals.swap(0, 1);
         });
+    }
+
+    #[test]
+    fn test_big_linear_tamper_int_lift_degree() {
+        let mut rng = rng();
+        let num_vars = 8;
+        let pp = setup_pp::<TestZincTypesIprs>(num_vars);
+        type Piop = ZincPlusPiop<TestZincTypesIprs, BigLinearUair<i64>, F, DEGREE_PLUS_ONE>;
+        let (bin, arb, int) = BigLinearUair::<i64>::generate_witness(num_vars, &mut rng);
+        let (mut proof, _) =
+            Piop::prove::<CHECKED>(&pp, &bin, &arb, &int, num_vars, project_scalar_fn)
+                .expect("Prover failed");
+
+        let lift = proof.lifted_evals.last_mut().unwrap();
+        lift.coeffs.push(lift.coeffs[0].clone() - &lift.coeffs[0]);
+
+        let res = Piop::verify::<_, CHECKED>(
+            &pp,
+            proof,
+            num_vars,
+            project_scalar_fn,
+            |ideal, field_cfg| ideal.map(|i| DegreeOneIdeal::from_with_cfg(i, field_cfg)),
+        );
+        assert!(matches!(res, Err(ProtocolError::LiftedEvalDegree { .. })));
     }
 
     #[test]
