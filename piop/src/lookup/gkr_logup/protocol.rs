@@ -1046,6 +1046,10 @@ where
         if lifts.len() != num_chunks {
             return Err(GkrLogupError::GkrLeafMismatch);
         }
+        // The protocol binds only the first coefficient of an int lift; reject longer ones.
+        if meta.table_type.reads_int_columns() && lifts.iter().any(|lift| lift.coeffs.len() > 1) {
+            return Err(GkrLogupError::GkrLeafMismatch);
+        }
         let mut psi_combined = zero.clone();
         for k in 0..num_chunks {
             let psi =
@@ -1732,6 +1736,30 @@ mod tests {
             n_vars: zinc_utils::log2(columns[0].evaluations.len()) as usize,
         };
         prove_group_selected::<F>(&mut Blake3Transcript::new(), &instance, &())
+    }
+
+    /// A latin square's selections bound to an all-ones grid through second coefficients.
+    #[test]
+    fn a_selected_lift_past_one_coefficient_is_refused() {
+        let rows = 8;
+        let fake = latin_square([[1, 2, 3], [2, 3, 1], [3, 1, 2]], rows);
+        let truth = latin_square([[1, 1, 1], [1, 1, 1], [1, 1, 1]], rows);
+        let (mut proof, meta, sub) =
+            prove_latin(&fake, latin_table(latin_selections())).expect("prove");
+        let a: F = F::from(7u64);
+        let eq = build_eq_x_r_vec(&sub.r_inner, &()).expect("eq");
+        let eval = |col: &DenseMultilinearExtension<Inner>| {
+            col.evaluations.iter().zip(&eq).fold(F::from(0u64), |acc, (c, e)| {
+                acc + &(e.clone() * &F::new_unchecked_with_cfg(c.clone(), &()))
+            })
+        };
+        for (lift, column) in proof.chunk_lifts[0].iter_mut().zip(&truth) {
+            let held = eval(column);
+            let shown = (lift.coeffs[0].clone() - held.clone()) / &a;
+            *lift = DynamicPolynomialF::new_trimmed(vec![held, shown]);
+        }
+        let res = verify_group::<F>(&mut Blake3Transcript::new(), &proof, &meta, &a, &());
+        assert!(matches!(res, Err(GkrLogupError::GkrLeafMismatch)), "{res:?}");
     }
 
     /// Six selections over three columns -- neither count a power of two --
