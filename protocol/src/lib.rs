@@ -1342,6 +1342,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_e2e_pointer_hop_lift_past_one_coefficient_rejected() {
+        let num_vars = POINTER_HOP_NUM_VARS;
+        do_test::<TestZincTypesIprs, PointerHopUair<ZtInt>>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+            |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
+            |proof| {
+                let bar_u = &mut proof.pq_int_lifted_at_r_a[0];
+                bar_u.coeffs.push(bar_u.coeffs[0].clone() - bar_u.coeffs[0].clone());
+            },
+            |res| assert!(matches!(res, Err(ProtocolError::PointerQueryLiftedShape))),
+        );
+    }
+
     /// End-to-end test of the wired GKR-LogUp lookup path: 16 binary_poly
     /// columns, all declared as a single BitPoly{32,8} lookup group
     /// (n_groups = 1 → step-7 two-open fast path). Exercises step4b_lookup
