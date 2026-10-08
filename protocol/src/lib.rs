@@ -197,6 +197,12 @@ pub enum ProtocolError<F: PrimeField, I: Ideal> {
     Pcs(#[from] ZipError),
     #[error("PCS verification failed at column {0}: {1}")]
     PcsVerification(usize, ZipError),
+    #[error("commitment {lane} batches {got} polynomials, the signature has {expected}")]
+    CommitmentBatchSize {
+        lane: usize,
+        expected: usize,
+        got: usize,
+    },
 }
 
 //
@@ -655,6 +661,13 @@ mod tests {
     fn test_big_linear_tamper_down_evals() {
         big_linear_verify_tampered(|proof| {
             proof.resolver.down_evals.swap(0, 1);
+        });
+    }
+
+    #[test]
+    fn test_big_linear_tamper_int_batch_size() {
+        big_linear_verify_tampered(|proof| {
+            proof.commitments.2.batch_size = 0;
         });
     }
 

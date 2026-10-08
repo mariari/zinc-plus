@@ -73,6 +73,25 @@ where
     where
         IdealOverF: Ideal + IdealCheck<DynamicPolynomialF<F>>,
     {
+        // Step 6 skips a lane with an empty batch, so batch sizes must match the signature.
+        let sig = U::signature();
+        for (lane, (comm, expected)) in [
+            (&proof.commitments.0, sig.binary_poly_cols),
+            (&proof.commitments.1, sig.arbitrary_poly_cols),
+            (&proof.commitments.2, sig.int_cols),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if comm.batch_size != expected {
+                return Err(ProtocolError::CommitmentBatchSize {
+                    lane,
+                    expected,
+                    got: comm.batch_size,
+                });
+            }
+        }
+
         // === Step 0: Reconstruct transcript from commitments ===
         let mut pcs_transcript = PcsVerifierTranscript {
             fs_transcript: KeccakTranscript::default(),
@@ -195,7 +214,6 @@ where
             }};
         }
 
-        let sig = U::signature();
         let (n_bin, n_arb, _n_int) = (sig.binary_poly_cols, sig.arbitrary_poly_cols, sig.int_cols);
         verify_pcs_batch!(Zt::BinaryZt, Zt::BinaryLc, vp_bin, 0, [..n_bin]);
         verify_pcs_batch!(
