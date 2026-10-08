@@ -2053,6 +2053,22 @@ mod tests {
     }
 
     #[test]
+    fn test_big_linear_tamper_int_batch_size() {
+        let num_vars = 8;
+        do_test::<TestZincTypesIprs, BigLinearUair<ZtInt>>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+            default_project_ideal!(),
+            |proof| proof.commitments.2.batch_size = 0,
+            |res| assert!(matches!(res, Err(ProtocolError::CommitmentBatchSize { .. }))),
+        );
+    }
+
+    #[test]
     fn test_big_linear_tamper_up_evals() {
         let num_vars = 8;
         do_test::<TestZincTypesIprs, BigLinearUairWithPublicInput<ZtInt>>(

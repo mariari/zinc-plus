@@ -323,6 +323,25 @@ where
             vp_int,
         };
 
+        // Step 7 skips a lane with an empty batch, so batch sizes must match the signature.
+        let witness = base.uair_signature.witness_cols();
+        for (lane, (comm, expected)) in [
+            (&proof.commitments.0, witness.num_binary_poly_cols()),
+            (&proof.commitments.1, witness.num_arbitrary_poly_cols()),
+            (&proof.commitments.2, witness.num_int_cols()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if comm.batch_size != expected {
+                return Err(ProtocolError::CommitmentBatchSize {
+                    lane,
+                    expected,
+                    got: comm.batch_size,
+                });
+            }
+        }
+
         for comm in [
             &proof.commitments.0,
             &proof.commitments.1,
