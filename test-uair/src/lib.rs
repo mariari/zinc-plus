@@ -216,7 +216,7 @@ where
 }
 
 /// Synthetic Word-lookup UAIR: four witness integer columns, all
-/// declared as a single `Word { width: 16, chunk_width: 8 }` lookup
+/// declared as a single `Word { width: 16 }` lookup
 /// group. The algebraic constraint is trivial -- the range check is the
 /// whole point -- so a proof of this UAIR is exactly the claim that
 /// every cell of every int column lies in `[0, 2^16)`.
@@ -245,10 +245,7 @@ where
         let lookup_specs: Vec<LookupColumnSpec> = (0..INT_WORD_COLS)
             .map(|i| LookupColumnSpec {
                 column_index: i,
-                table_type: LookupTableType::Word {
-                    width: WIDTH,
-                    chunk_width: Some(8),
-                },
+                table_type: LookupTableType::Word { width: WIDTH, chunk_width: None },
             })
             .collect();
         UairSignature::new(total, PublicColumnLayout::default(), vec![], lookup_specs, vec![])
@@ -751,7 +748,7 @@ where
                     column_index: i,
                     table_type: LookupTableType::Word {
                         width: INT_WORD_WIDTH,
-                        chunk_width: Some(8),
+                        chunk_width: None,
                     },
                 })
                 .collect(),

@@ -58,9 +58,11 @@ impl LookupTableType {
     }
 
     /// How many multiset claims a group of `num_columns` columns makes:
-    /// one per column, unless the table names the cells itself.
+    /// one per column, unless the table names the cells itself or, as a
+    /// `Word` range does, reads every column into one multiset.
     pub fn num_claims(&self, num_columns: usize) -> usize {
         match self {
+            Self::Word { .. } => 1,
             Self::Selected { selections, .. } => selections.len(),
             Self::Permuted { pairs } => mul!(pairs.len(), 2),
             _ => num_columns,

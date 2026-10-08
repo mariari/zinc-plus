@@ -45,7 +45,7 @@ use super::structs::{
 };
 use super::tables::{
     generate_bitpoly_table, generate_prescribed_table, generate_word_table,
-    prescribed_multiplicities, word_shift,
+    prescribed_multiplicities,
 };
 
 // ---------------------------------------------------------------------------
@@ -438,195 +438,6 @@ where
     FractionPhase { witness_result, table_gkr }
 }
 
-/// Inputs to [`prove_group_word`] and [`prove_group_prescribed`] for a
-/// single lookup group of integer columns.
-///
-/// Where a BitPoly parent is a column of polynomials, these parents are
-/// columns of integers -- the trace's `int` group -- so the cell already
-/// holds the number the table is indexed by, and no projection is needed
-/// to recover it.
-pub struct IntLookupInstance<'a, F: PrimeField, I> {
-    /// L parent column MLEs (integer-valued).
-    pub parent_columns: Vec<&'a DenseMultilinearExtension<I>>,
-    /// L flat-trace column indices, mirrored into the proof's group meta.
-    pub parent_column_indices: Vec<usize>,
-    /// Lookup table type -- must read integer columns.
-    pub table_type: LookupTableType,
-    /// Projecting element, threaded from step 3 for transcript parity.
-    pub projecting_element_f: &'a F,
-    /// Number of MLE variables of each parent column (= log2(W)).
-    pub n_vars: usize,
-}
-
-/// Read an integer cell as the unsigned number the Word table indexes by.
-///
-/// `ConstTranscribable` is the only integer-shaped thing `Zt::Int` is
-/// guaranteed to offer, and it is enough: the transcription is the
-/// value's own little-endian bytes. A negative cell transcribes with its
-/// high bits set, so it reads back far above any `2^width` and simply is
-/// not in the table -- which is the refusal a range check is for, not a
-/// special case to write.
-fn word_of<I: ConstTranscribable>(cell: &I) -> u128 {
-    let mut buf = vec![0u8; I::NUM_BYTES];
-    cell.write_transcription_bytes_exact(&mut buf);
-    let mut value: u128 = 0;
-    for (i, byte) in buf.iter().take(16).enumerate() {
-        value |= (*byte as u128) << (8 * i);
-    }
-    // Any byte beyond the low 16 that is set puts the cell out of every
-    // Word table we can build, so saturate rather than wrap into range.
-    if buf.iter().skip(16).any(|b| *b != 0) {
-        return u128::MAX;
-    }
-    value
-}
-
-/// The Word half of [`prove_group`]: same proof, different parents.
-#[allow(clippy::arithmetic_side_effects)]
-pub fn prove_group_word<F, I>(
-    transcript: &mut impl Transcript,
-    instance: &IntLookupInstance<'_, F, I>,
-    field_cfg: &F::Config,
-) -> Result<
-    (GkrLogupGroupProof<F>, GkrLogupGroupMeta, GkrLogupGroupSubclaim<F>),
-    GkrLogupError<F>,
->
-where
-    F: InnerTransparentField + FromPrimitiveWithConfig + Send + Sync,
-    F::Inner: ConstTranscribable + Zero + Default + Send + Sync,
-    F::Modulus: ConstTranscribable,
-    F::Config: Sync,
-    I: ConstTranscribable + Clone + Send + Sync,
-{
-    let (width, chunk_width) = match instance.table_type {
-        LookupTableType::Word { width, chunk_width: Some(cw) } => (width, cw),
-        LookupTableType::Word { width, chunk_width: None } => (width, width),
-        _ => return Err(GkrLogupError::WitnessNotInTable),
-    };
-    assert!(chunk_width > 0 && width % chunk_width == 0, "chunk_width must divide width");
-    assert!(chunk_width < 32, "chunk_width must leave a u32 chunk index");
-    let num_chunks = width / chunk_width;
-    // The witness fraction tree has num_chunks * witness_len leaves. Both
-    // the BitPoly path and this one only ever build power-of-two trees --
-    // BitPoly because its chunk count always is one -- so the padded case
-    // is untested rather than supported. Refuse the shape here, where the
-    // reason is legible, rather than emit a proof the verifier rejects.
-    assert!(
-        num_chunks.is_power_of_two(),
-        "width / chunk_width must be a power of two, got {num_chunks}"
-    );
-    let num_lookups = instance.parent_columns.len();
-    let n_vars = instance.n_vars;
-    let witness_len = 1usize << n_vars;
-    let zero = F::zero_with_cfg(field_cfg);
-
-    // ---- Step 1: chunk indices straight off the integers ----
-    //
-    // No bit walk and no reverse lookup: the cell is the number, so a
-    // chunk is a shift and a mask. A cell too wide for the table lands
-    // outside it by construction and the lookup refuses.
-    let chunk_mask: u128 = (1u128 << chunk_width) - 1;
-    let mut chunks_idx: Vec<Vec<Vec<u32>>> = Vec::with_capacity(num_lookups);
-    for parent in &instance.parent_columns {
-        let mut per_chunk = vec![Vec::with_capacity(witness_len); num_chunks];
-        for i in 0..witness_len {
-            let value = word_of(&parent.evaluations[i]);
-            for (k, out) in per_chunk.iter_mut().enumerate() {
-                let shifted = value
-                    .checked_shr((k * chunk_width) as u32)
-                    .unwrap_or(0);
-                let idx = shifted & chunk_mask;
-                // Saturating: an out-of-table cell must miss the table,
-                // never alias into it.
-                out.push(if value >= (1u128 << width) {
-                    u32::MAX
-                } else {
-                    idx as u32
-                });
-            }
-        }
-        chunks_idx.push(per_chunk);
-    }
-
-    // ---- Step 2: the Word subtable is the integers themselves ----
-    let subtable: Vec<F> = generate_word_table(chunk_width, field_cfg);
-    if chunks_idx
-        .iter()
-        .flatten()
-        .flatten()
-        .any(|n| *n as usize >= subtable.len())
-    {
-        return Err(GkrLogupError::WitnessNotInTable);
-    }
-
-    let agg_mults = histogram_multiplicities::<F>(&chunks_idx, subtable.len(), field_cfg);
-    let FractionPhase { witness_result, table_gkr } = prove_fraction_phase(
-        transcript,
-        &WitnessLeaves::Indexed(&chunks_idx),
-        &subtable,
-        &agg_mults,
-        num_lookups,
-        num_chunks,
-        witness_len,
-        field_cfg,
-    );
-
-    // ---- Step 9: the parent's lift is one evaluation ----
-    //
-    // An integer cell has no coefficients to walk, so the lift of a
-    // chunk is the multilinear evaluation of that chunk's own column at
-    // r_inner, carried as a degree-0 polynomial.
-    let r_full = &witness_result.eval_point;
-    assert!(r_full.len() >= n_vars, "GKR descent must have at least n_vars row variables");
-    let r_inner: Vec<F> = r_full[..n_vars].to_vec();
-    let eq_table = build_eq_x_r_vec(&r_inner, field_cfg)
-        .map_err(|_| GkrLogupError::WitnessNotInTable)?;
-
-    let chunk_lifts: Vec<Vec<DynamicPolynomialF<F>>> = chunks_idx
-        .iter()
-        .map(|per_chunk| {
-            per_chunk
-                .iter()
-                .map(|chunk| {
-                    let mut acc = zero.clone();
-                    for (i, n) in chunk.iter().enumerate() {
-                        let term = F::from_with_cfg(*n as u64, field_cfg);
-                        acc = acc + &(eq_table[i].clone() * &term);
-                    }
-                    DynamicPolynomialF::new_trimmed(vec![acc])
-                })
-                .collect()
-        })
-        .collect();
-
-    // ---- Step 10: place value, not coefficient position ----
-    let combined_polynomial: Vec<DynamicPolynomialF<F>> = (0..num_lookups)
-        .map(|ell| combine_chunks_word::<F>(&chunk_lifts[ell], chunk_width, field_cfg))
-        .collect();
-
-    let meta = GkrLogupGroupMeta {
-        table_type: instance.table_type.clone(),
-        num_lookups,
-        num_chunks,
-        chunk_width,
-        witness_len,
-        parent_columns: instance.parent_column_indices.clone(),
-    };
-    let proof = GkrLogupGroupProof {
-        chunk_lifts,
-        aggregated_multiplicities: agg_mults,
-        witness_gkr: witness_result.proof,
-        table_gkr,
-        bin_lifts_at_r_inner: Vec::new(),
-    };
-    let subclaim = GkrLogupGroupSubclaim {
-        r_inner,
-        combined_polynomial,
-        parent_columns: meta.parent_columns.clone(),
-    };
-    Ok((proof, meta, subclaim))
-}
-
 /// A prescribed cell is looked up whole, so its group has one chunk and
 /// no width of its own; this is the width the rest of the protocol asks
 /// for and never divides anything by.
@@ -666,7 +477,7 @@ where
 #[allow(clippy::arithmetic_side_effects)]
 pub fn prove_group_prescribed<F, I>(
     transcript: &mut impl Transcript,
-    instance: &IntLookupInstance<'_, F, I>,
+    instance: &IntLookupInstance<'_, I>,
     field_cfg: &F::Config,
 ) -> Result<
     (GkrLogupGroupProof<F>, GkrLogupGroupMeta, GkrLogupGroupSubclaim<F>),
@@ -694,19 +505,17 @@ where
     // is refused here rather than proved against a table it misses.
     let (subtable, multiplicities) =
         prescribed_table_side::<F>(values, pad, witness_len, field_cfg)?;
-    let mut position: HashMap<u128, u32> = HashMap::with_capacity(subtable.len());
+    let mut position: HashMap<u64, u32> = HashMap::with_capacity(subtable.len());
     for (index, entry) in values.iter().chain(std::iter::once(&pad)).enumerate() {
-        position.insert(
-            u128::from(*entry),
-            u32::try_from(index).expect("a table this long has no index"),
-        );
+        position.insert(*entry, u32::try_from(index).expect("a table this long has no index"));
     }
+    let mut buf = vec![0u8; I::NUM_BYTES];
     let mut chunks_idx: Vec<Vec<Vec<u32>>> = Vec::with_capacity(num_lookups);
     for parent in &instance.parent_columns {
         let mut chunk = Vec::with_capacity(witness_len);
         for i in 0..witness_len {
-            let value = word_of(&parent.evaluations[i]);
-            match position.get(&value) {
+            let value = int_table_index(&parent.evaluations[i], 64, &mut buf);
+            match value.and_then(|value| position.get(&value)) {
                 Some(index) => chunk.push(*index),
                 None => return Err(GkrLogupError::WitnessNotInTable),
             }
@@ -753,10 +562,8 @@ where
                 .collect()
         })
         .collect();
-    let combined_polynomial: Vec<DynamicPolynomialF<F>> = chunk_lifts
-        .iter()
-        .map(|lifts| combine_chunks_word::<F>(lifts, PRESCRIBED_CHUNK_WIDTH, field_cfg))
-        .collect();
+    let combined_polynomial: Vec<DynamicPolynomialF<F>> =
+        chunk_lifts.iter().map(|lifts| lifts[0].clone()).collect();
 
     let meta = GkrLogupGroupMeta {
         table_type: instance.table_type.clone(),
@@ -774,6 +581,7 @@ where
         witness_gkr: witness_result.proof,
         table_gkr,
         bin_lifts_at_r_inner: Vec::new(),
+        int_evals_at_r_inner: Vec::new(),
     };
     let subclaim = GkrLogupGroupSubclaim {
         r_inner,
@@ -968,6 +776,7 @@ where
         witness_gkr: witness_result.proof,
         table_gkr,
         bin_lifts_at_r_inner: Vec::new(),
+        int_evals_at_r_inner: Vec::new(),
     };
     let subclaim = GkrLogupGroupSubclaim {
         r_inner,
@@ -1002,8 +811,7 @@ where
     let (width, chunk_width) = match &meta.table_type {
         LookupTableType::BitPoly { width, chunk_width: Some(cw) } => (*width, *cw),
         LookupTableType::BitPoly { width, chunk_width: None } => (*width, *width),
-        LookupTableType::Word { width, chunk_width: Some(cw) } => (*width, *cw),
-        LookupTableType::Word { width, chunk_width: None } => (*width, *width),
+        LookupTableType::Word { .. } => return Err(GkrLogupError::WitnessNotInTable),
         LookupTableType::Prescribed { .. }
         | LookupTableType::Selected { .. }
         | LookupTableType::Permuted { .. } => (PRESCRIBED_CHUNK_WIDTH, PRESCRIBED_CHUNK_WIDTH),
@@ -1042,13 +850,10 @@ where
     let one = F::one_with_cfg(field_cfg);
 
     // ---- Reconstruct subtable + shifts ----
-    // The subtable a chunk index reads against. For Word it is the
-    // integers themselves, so psi_a is the identity there and the leaf
-    // check below needs no case of its own. A prescribed or selected
+    // The subtable a chunk index reads against. A prescribed or selected
     // table is its values, and its multiplicities come with them: the
     // verifier builds that whole side and takes none of it from the proof.
     let (subtable, prescribed_mults) = match &meta.table_type {
-        LookupTableType::Word { .. } => (generate_word_table::<F>(chunk_width, field_cfg), None),
         LookupTableType::Prescribed { values, pad } => {
             let (table, multiplicities) =
                 prescribed_table_side::<F>(values, *pad, witness_len, field_cfg)?;
@@ -1261,16 +1066,12 @@ where
         LookupTableType::Selected { .. } | LookupTableType::Permuted { .. } => {
             proof.chunk_lifts[0].clone()
         }
-        // A cell read as a number recombines to one field element by
-        // place value; BitPoly chunks are coefficient blocks.
+        // BitPoly chunks are coefficient blocks.
         LookupTableType::BitPoly { .. } => (0..num_lookups)
             .map(|ell| combine_chunks::<F>(&proof.chunk_lifts[ell], chunk_width, width, &zero))
             .collect(),
-        _ => (0..num_lookups)
-            .map(|ell| {
-                combine_chunks_word::<F>(&proof.chunk_lifts[ell], chunk_width, field_cfg)
-            })
-            .collect(),
+        // A prescribed cell is looked up whole: its one chunk is the claim.
+        _ => proof.chunk_lifts.iter().map(|lifts| lifts[0].clone()).collect(),
     };
 
     Ok(GkrLogupGroupSubclaim {
@@ -1793,34 +1594,6 @@ pub fn combine_chunks<F: PrimeField>(
     DynamicPolynomialF::new_trimmed(coeffs)
 }
 
-/// Combine K Word chunk lifts into the parent's claim at `r_inner`.
-///
-/// A Word cell is an integer, not a polynomial, so its chunks carry
-/// place value rather than coefficient position: the parent is
-/// `Σ_k 2^{k · chunk_width} · chunk_k`, one field element, which rides
-/// as a degree-0 polynomial so the rest of the protocol -- which only
-/// ever evaluates these at the projecting element -- needs no case.
-#[allow(clippy::arithmetic_side_effects)]
-pub fn combine_chunks_word<F: PrimeField + FromPrimitiveWithConfig>(
-    chunks: &[DynamicPolynomialF<F>],
-    chunk_width: usize,
-    field_cfg: &F::Config,
-) -> DynamicPolynomialF<F> {
-    let mut acc = F::zero_with_cfg(field_cfg);
-    let mut place = F::one_with_cfg(field_cfg);
-    let shift = word_shift::<F>(chunk_width, field_cfg);
-    for chunk in chunks {
-        let value = chunk
-            .coeffs
-            .first()
-            .cloned()
-            .unwrap_or_else(|| F::zero_with_cfg(field_cfg));
-        acc = acc + &(place.clone() * &value);
-        place = place * &shift;
-    }
-    DynamicPolynomialF::new_trimmed(vec![acc])
-}
-
 /// `eq(index, r)` read off the index's bits rather than out of a table:
 /// a verifier wanting a handful of these pays for those and not for the
 /// whole cube. Agrees with `build_eq_x_r_vec`, whose entry `j` pairs
@@ -1868,51 +1641,6 @@ mod tests {
         DenseMultilinearExtension::from_evaluations_vec(n_vars, evals, BinaryPoly::<32>::zero())
     }
 
-    /// A column of integers proves and verifies against Word(16), and
-    /// the parent claim the verifier is left holding is the integers'
-    /// own multilinear evaluation -- place value, not coefficients.
-    #[test]
-    fn round_trip_word16_over_int_column() {
-        let cfg = ();
-        let n_vars = 5; // W = 32
-        let witness_len = 1usize << n_vars;
-        // Values inside Word(16).
-        let cells: Vec<i64> = (0..witness_len).map(|i| ((i * 613) % 65536) as i64).collect();
-        let parent = DenseMultilinearExtension::from_evaluations_vec(n_vars, cells.clone(), 0i64);
-
-        let a: F = F::from(7u64);
-        let table_type = LookupTableType::Word { width: 16, chunk_width: Some(8) };
-        let instance = IntLookupInstance::<'_, F, i64> {
-            parent_columns: vec![&parent],
-            parent_column_indices: vec![0],
-            table_type: table_type.clone(),
-            projecting_element_f: &a,
-            n_vars,
-        };
-
-        let mut p_ts = Blake3Transcript::new();
-        let (proof, meta, prover_sub) =
-            prove_group_word::<F, i64>(&mut p_ts, &instance, &cfg).expect("prove");
-
-        let mut v_ts = Blake3Transcript::new();
-        let verifier_sub =
-            verify_group::<F>(&mut v_ts, &proof, &meta, &a, &cfg).expect("verify");
-
-        assert_eq!(prover_sub.r_inner, verifier_sub.r_inner);
-        assert_eq!(prover_sub.combined_polynomial, verifier_sub.combined_polynomial);
-
-        // The parent claim is Σ_i eq(i, r) · cell_i, as a degree-0 poly.
-        let eq = build_eq_x_r_vec(&verifier_sub.r_inner, &cfg).expect("eq");
-        let mut expected = F::from(0u64);
-        for (i, c) in cells.iter().enumerate() {
-            expected = expected + &(eq[i].clone() * &F::from(*c as u64));
-        }
-        assert_eq!(
-            verifier_sub.combined_polynomial[0],
-            DynamicPolynomialF::new_trimmed(vec![expected])
-        );
-    }
-
     /// A column holding a permutation of 1..=9 and nothing else but pad
     /// is the multiset the table prescribes, so it proves and verifies,
     /// and the claim the verifier is left holding is the column's own
@@ -1925,11 +1653,10 @@ mod tests {
         let parent = DenseMultilinearExtension::from_evaluations_vec(n_vars, cells.clone(), 0i64);
 
         let a: F = F::from(7u64);
-        let instance = IntLookupInstance::<'_, F, i64> {
+        let instance = IntLookupInstance::<'_, i64> {
             parent_columns: vec![&parent],
             parent_column_indices: vec![0],
             table_type: LookupTableType::Prescribed { values: (1..=9).collect(), pad: 0 },
-            projecting_element_f: &a,
             n_vars,
         };
 
@@ -2165,11 +1892,10 @@ mod tests {
         let cells: Vec<i64> = vec![4, 9, 2, 3, 5, 7, 9, 1, 6, 0, 0, 0, 0, 0, 0, 0];
         let parent = DenseMultilinearExtension::from_evaluations_vec(n_vars, cells, 0i64);
         let a: F = F::from(7u64);
-        let instance = IntLookupInstance::<'_, F, i64> {
+        let instance = IntLookupInstance::<'_, i64> {
             parent_columns: vec![&parent],
             parent_column_indices: vec![0],
             table_type: LookupTableType::Prescribed { values: (1..=9).collect(), pad: 0 },
-            projecting_element_f: &a,
             n_vars,
         };
 
@@ -2191,16 +1917,14 @@ mod tests {
     fn a_value_outside_the_prescribed_table_is_refused() {
         let cfg = ();
         let n_vars = 4;
-        let a: F = F::from(7u64);
         for bad in [10i64, -1i64] {
             let mut cells: Vec<i64> = vec![4, 9, 2, 3, 5, 7, 8, 1, 6, 0, 0, 0, 0, 0, 0, 0];
             cells[0] = bad;
             let parent = DenseMultilinearExtension::from_evaluations_vec(n_vars, cells, 0i64);
-            let instance = IntLookupInstance::<'_, F, i64> {
+            let instance = IntLookupInstance::<'_, i64> {
                 parent_columns: vec![&parent],
                 parent_column_indices: vec![0],
                 table_type: LookupTableType::Prescribed { values: (1..=9).collect(), pad: 0 },
-                projecting_element_f: &a,
                 n_vars,
             };
             let mut ts = Blake3Transcript::new();
@@ -2219,74 +1943,18 @@ mod tests {
         let cfg = ();
         let n_vars = 2; // W = 4.
         let parent = DenseMultilinearExtension::from_evaluations_vec(n_vars, vec![1i64; 4], 0i64);
-        let a: F = F::from(7u64);
         for table_type in [
             LookupTableType::Prescribed { values: vec![1, 2, 3], pad: 2 },
             LookupTableType::Prescribed { values: (1..=9).collect(), pad: 0 },
         ] {
-            let instance = IntLookupInstance::<'_, F, i64> {
+            let instance = IntLookupInstance::<'_, i64> {
                 parent_columns: vec![&parent],
                 parent_column_indices: vec![0],
                 table_type,
-                projecting_element_f: &a,
                 n_vars,
             };
             let mut ts = Blake3Transcript::new();
             assert!(prove_group_prescribed::<F, i64>(&mut ts, &instance, &cfg).is_err());
-        }
-    }
-
-    /// The witness fraction tree is built over `num_chunks · witness_len`
-    /// leaves and only the power-of-two case is exercised, so a chunk
-    /// count that is not one is refused where the reason is readable
-    /// rather than surfacing later as a verifier rejection.
-    #[test]
-    #[should_panic(expected = "must be a power of two")]
-    fn a_chunk_count_that_is_not_a_power_of_two_is_refused() {
-        let cfg = ();
-        let n_vars = 5;
-        let cells: Vec<i64> = (0..(1usize << n_vars)).map(|i| (i % 256) as i64).collect();
-        let parent = DenseMultilinearExtension::from_evaluations_vec(n_vars, cells, 0i64);
-        let a: F = F::from(7u64);
-        let instance = IntLookupInstance::<'_, F, i64> {
-            parent_columns: vec![&parent],
-            parent_column_indices: vec![0],
-            // 20 / 4 = 5 chunks.
-            table_type: LookupTableType::Word { width: 20, chunk_width: Some(4) },
-            projecting_element_f: &a,
-            n_vars,
-        };
-        let mut ts = Blake3Transcript::new();
-        let _ = prove_group_word::<F, i64>(&mut ts, &instance, &cfg);
-    }
-
-    /// The whole point: a cell outside the table cannot be proved. A
-    /// negative slack is exactly this case -- it reads back above every
-    /// 2^width -- so the range check refuses rather than proving.
-    #[test]
-    fn a_cell_outside_the_word_table_is_refused() {
-        let cfg = ();
-        let n_vars = 5;
-        let witness_len = 1usize << n_vars;
-        let a: F = F::from(7u64);
-        let table_type = LookupTableType::Word { width: 16, chunk_width: Some(8) };
-
-        for bad in [70_000i64, -1i64, -96i64] {
-            let mut cells: Vec<i64> = (0..witness_len).map(|i| (i % 256) as i64).collect();
-            cells[3] = bad;
-            let parent = DenseMultilinearExtension::from_evaluations_vec(n_vars, cells, 0i64);
-            let instance = IntLookupInstance::<'_, F, i64> {
-                parent_columns: vec![&parent],
-                parent_column_indices: vec![0],
-                table_type: table_type.clone(),
-                projecting_element_f: &a,
-                n_vars,
-            };
-            let mut ts = Blake3Transcript::new();
-            assert!(
-                prove_group_word::<F, i64>(&mut ts, &instance, &cfg).is_err(),
-                "a cell of {bad} is not in Word(16) and must not prove"
-            );
         }
     }
 
@@ -2497,6 +2165,41 @@ mod tests {
                 "out-of-range cell must be rejected by the prover"
             );
         }
+    }
+
+    /// A chunked Word cell recombines by place value, a linear map with
+    /// room in it: chunk lifts sent after the descent can meet both the leaf
+    /// check and the recombination for a cell out of range. Both sides
+    /// refuse the chunked table over int columns.
+    #[test]
+    fn int_chunked_word_refused() {
+        let cfg = ();
+        let mut rng = StdRng::seed_from_u64(16);
+        let n_vars = 5;
+        let col = rand_int_col(n_vars, 16, &mut rng);
+        let chunked = LookupTableType::Word { width: 16, chunk_width: Some(8) };
+        let instance = IntLookupInstance::<'_, i64> {
+            parent_columns: vec![&col],
+            parent_column_indices: vec![0],
+            table_type: chunked.clone(),
+            n_vars,
+        };
+        let mut p_ts = Blake3Transcript::new();
+        assert!(matches!(
+            prove_group_int::<F, i64>(&mut p_ts, &instance, &cfg),
+            Err(GkrLogupError::WitnessNotInTable)
+        ));
+
+        let whole = IntLookupInstance {
+            table_type: LookupTableType::Word { width: 16, chunk_width: None },
+            ..instance
+        };
+        let mut p_ts = Blake3Transcript::new();
+        let (proof, mut meta, _) = prove_group_int::<F, i64>(&mut p_ts, &whole, &cfg).expect("prove");
+        meta.table_type = chunked;
+        let a = F::from(7u64);
+        assert!(verify_group_int::<F>(&mut Blake3Transcript::new(), &proof, &meta, &cfg).is_err());
+        assert!(verify_group::<F>(&mut Blake3Transcript::new(), &proof, &meta, &a, &cfg).is_err());
     }
 
     #[test]

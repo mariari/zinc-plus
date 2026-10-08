@@ -155,12 +155,6 @@ pub struct Proof<F: PrimeField> {
     /// Empty when `pointer_query_proof` is `None`.
     pub pq_int_lifted_at_r_a: Vec<DynamicPolynomialF<F>>,
     pub pq_int_lifted_at_r_b: Vec<DynamicPolynomialF<F>>,
-    /// Witness-int lifted evaluations at the `r_inner` of each lookup
-    /// group whose parents are integer columns, in group order, each
-    /// discharged by one extra int-batch opening. Empty when the UAIR
-    /// declares no such lookup. This is what ties a group's parent claim
-    /// to the integer columns actually committed.
-    pub lookup_int_lifted: Vec<Vec<DynamicPolynomialF<F>>>,
 }
 
 impl<F> GenTranscribable for Proof<F>
@@ -192,18 +186,6 @@ where
 
         let (lookup_proof, bytes) =
             GkrLogupLookupProof::<F>::read_transcription_bytes_subset(bytes);
-
-        // lookup_int_lifted: [groups: u32] then one length-prefixed
-        // DynamicPolyVecF per group. Always present, zero groups when
-        // none reads integer columns, so it needs no presence flag.
-        let (int_groups, mut bytes) = u32::read_transcription_bytes_subset(bytes);
-        let mut lookup_int_lifted =
-            Vec::with_capacity(usize::try_from(int_groups).expect("group count fits in usize"));
-        for _ in 0..int_groups {
-            let (lifted_vec, rest) = DynamicPolyVecF::<F>::read_transcription_bytes_subset(bytes);
-            lookup_int_lifted.push(lifted_vec.0);
-            bytes = rest;
-        }
 
         // [reducer_present: u8] [reducer_proof? : subset] [bin_lifts? : subset]
         let reducer_present = bytes[0];
@@ -271,7 +253,6 @@ where
             pointer_query_proof,
             pq_int_lifted_at_r_a,
             pq_int_lifted_at_r_b,
-            lookup_int_lifted,
         }
     }
 
@@ -307,15 +288,6 @@ where
         // lookup_proof: u32 length prefix + GkrLogupLookupProof encoding
         let buf = self.lookup_proof.write_transcription_bytes_subset(buf);
 
-        // lookup_int_lifted: [groups: u32] then one length-prefixed
-        // DynamicPolyVecF per int-column group.
-        let int_groups =
-            u32::try_from(self.lookup_int_lifted.len()).expect("group count fits in u32");
-        let mut buf = int_groups.write_transcription_bytes_subset(buf);
-        for lifted in &self.lookup_int_lifted {
-            buf = DynamicPolyVecF::reinterpret(lifted).write_transcription_bytes_subset(buf);
-        }
-
         // [reducer_present: u8] then optional reducer_proof + bin_lifts.
         let buf = match &self.bin_reducer_proof {
             None => {
@@ -337,13 +309,14 @@ where
 
         // [int_reducer_present: u8] then optional reducer_proof + modulus +
         // [u32 n] + n × F::Inner (the evals at the int reducer's r*).
-        match &self.int_reducer_proof {
+        let buf = match &self.int_reducer_proof {
             None => {
                 assert!(
                     self.int_evals_at_r_star.is_empty(),
                     "int_evals_at_r_star must be empty when the int reducer is absent"
                 );
                 buf[0] = 0;
+                &mut buf[1..]
             }
             Some(rp) => {
                 buf[0] = 1;
@@ -355,7 +328,27 @@ where
                     .expect("int eval count must fit in u32");
                 n.write_transcription_bytes_exact(&mut buf[..u32::NUM_BYTES]);
                 let buf = &mut buf[u32::NUM_BYTES..];
-                zinc_transcript::append_field_vec_inner(buf, &self.int_evals_at_r_star);
+                zinc_transcript::append_field_vec_inner(buf, &self.int_evals_at_r_star)
+            }
+        };
+
+        // [pq_present: u8] then optional pointer-query proof + lifted evals.
+        match &self.pointer_query_proof {
+            None => {
+                assert!(
+                    self.pq_int_lifted_at_r_a.is_empty() && self.pq_int_lifted_at_r_b.is_empty(),
+                    "pq lifted evals must be empty when the pointer query is absent"
+                );
+                buf[0] = 0;
+            }
+            Some(pq) => {
+                buf[0] = 1;
+                let buf = &mut buf[1..];
+                let buf = pq.write_transcription_bytes_subset(buf);
+                let buf = DynamicPolyVecF::reinterpret(&self.pq_int_lifted_at_r_a)
+                    .write_transcription_bytes_subset(buf);
+                DynamicPolyVecF::reinterpret(&self.pq_int_lifted_at_r_b)
+                    .write_transcription_bytes_subset(buf);
             }
         }
     }
@@ -385,15 +378,6 @@ where
             + witness_vec.get_num_bytes()
             + GkrLogupLookupProof::<F>::LENGTH_NUM_BYTES
             + self.lookup_proof.get_num_bytes()
-            + u32::NUM_BYTES // int lookup group count
-            + self
-                .lookup_int_lifted
-                .iter()
-                .map(|lifted| {
-                    DynamicPolyVecF::<F>::LENGTH_NUM_BYTES
-                        + DynamicPolyVecF::reinterpret(lifted).get_num_bytes()
-                })
-                .sum::<usize>()
             + 1 // reducer_present flag
             + match &self.bin_reducer_proof {
                 None => 0,
@@ -1139,7 +1123,8 @@ mod tests {
         IntPrescribedLookupUair, IntWordLookupUair, PRESCRIBED_OUTSIDE, PRESCRIBED_PERMUTATION,
         PRESCRIBED_REPEAT, PRESCRIBED_SHORT, SUDOKU_DUPLICATE, SUDOKU_SLID, SUDOKU_SOLVED,
         SUDOKU_SWAPPED, SUDOKU_UNSELECTED, SudokuSelectedUair, sudoku_selections,
-        RANGED_BOTH, RANGED_DUPLICATE, RANGED_GRID_ONLY, RANGED_OVER_WIDTH, RANGED_SOLVED,
+        RANGED_BOTH, RANGED_COLS, RANGED_DUPLICATE, RANGED_GRID_ONLY, RANGED_OVER_WIDTH,
+        RANGED_SOLVED,
         SUDOKU_COLS, SudokuRangedUair,
         IntLookup16OutOfRangeUair, IntLookup16Uair, MixedBinIntLookupUair,
         BitOpRotUair, BrokenPointerHopUair, EC_FP_INT_LIMBS, GenerateRandomTrace,
@@ -1752,10 +1737,10 @@ mod tests {
     }
 
     /// End-to-end test of the Word lookup over integer columns: four
-    /// witness int columns, all declared as one `Word{16, 8}` group.
-    /// Exercises prove_group_word, the int parent binding against the
-    /// witness-int lifted evaluations, the extra int opening at the
-    /// group's r_inner, and the proof serialization round trip.
+    /// witness int columns, all declared as one `Word{16}` group.
+    /// Exercises prove_group_int, the int parent binding against the
+    /// group's evals at r_inner, the int reducer, and the proof
+    /// serialization round trip.
     #[test]
     fn test_e2e_int_word_lookup() {
         let num_vars = 8;
@@ -1788,7 +1773,7 @@ mod tests {
             ),
             |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
             |proof| {
-                let c = &mut proof.lookup_int_lifted[0][0].coeffs[0];
+                let c = &mut proof.lookup_proof.groups[0].int_evals_at_r_inner[0];
                 *c = c.clone() + c.clone();
             },
             |res| {
@@ -2320,7 +2305,13 @@ mod tests {
                     LookupTableType::Selected { .. }
                 ));
                 assert_eq!(proof.lookup_proof.group_meta[1].num_lookups, 27);
-                assert_eq!(proof.lookup_int_lifted.len(), 2);
+                assert!(
+                    proof
+                        .lookup_proof
+                        .groups
+                        .iter()
+                        .all(|group| group.int_evals_at_r_inner.len() == RANGED_COLS)
+                );
             },
             |res| res.unwrap(),
         );
@@ -2342,7 +2333,7 @@ mod tests {
             ),
             |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
             |proof| {
-                let c = &mut proof.lookup_int_lifted[0][SUDOKU_COLS].coeffs[0];
+                let c = &mut proof.lookup_proof.groups[0].int_evals_at_r_inner[SUDOKU_COLS];
                 *c = c.clone() + c.clone();
             },
             |res| {
@@ -2365,7 +2356,7 @@ mod tests {
             ),
             |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
             |proof| {
-                let c = &mut proof.lookup_int_lifted[1][0].coeffs[0];
+                let c = &mut proof.lookup_proof.groups[1].int_evals_at_r_inner[0];
                 *c = c.clone() + c.clone();
             },
             |res| {
@@ -2436,7 +2427,6 @@ mod tests {
             |proof| {
                 proof.lookup_proof.groups.truncate(1);
                 proof.lookup_proof.group_meta.truncate(1);
-                proof.lookup_int_lifted.truncate(1);
             },
             |res| {
                 assert!(
@@ -2468,7 +2458,6 @@ mod tests {
             |proof| {
                 proof.lookup_proof.groups.swap(0, 1);
                 proof.lookup_proof.group_meta.swap(0, 1);
-                proof.lookup_int_lifted.swap(0, 1);
             },
             |res| {
                 assert!(
@@ -2499,7 +2488,7 @@ mod tests {
             |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
             |proof| {
                 assert!(proof.int_reducer_proof.is_some());
-                let c = &mut proof.int_lifts_at_r_star[0].coeffs[0];
+                let c = &mut proof.int_evals_at_r_star[0];
                 *c = c.clone() + c.clone();
             },
             |res| {
@@ -2535,7 +2524,7 @@ mod tests {
                 assert!(proof.int_reducer_proof.is_some());
                 let gammas = crate::test_capture::take::<F>();
                 assert!(
-                    proof.int_lifts_at_r_star.len() >= 3 && gammas.len() >= 3,
+                    proof.int_evals_at_r_star.len() >= 3 && gammas.len() >= 3,
                     "need at least three int columns to span the null space"
                 );
                 let deltas = [
@@ -2543,11 +2532,8 @@ mod tests {
                     gammas[2].clone() - gammas[0].clone(),
                     gammas[0].clone() - gammas[1].clone(),
                 ];
-                for (lift, delta) in proof.int_lifts_at_r_star[..3].iter_mut().zip(deltas) {
-                    // These grid cells are non-zero, so each lift carries its
-                    // one coefficient; move it by δ within the null space.
-                    let c = &mut lift.coeffs[0];
-                    *c = c.clone() + delta;
+                for (eval, delta) in proof.int_evals_at_r_star[..3].iter_mut().zip(deltas) {
+                    *eval = eval.clone() + delta;
                 }
             },
             |res| {
@@ -2578,7 +2564,7 @@ mod tests {
             |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
             |proof| {
                 proof.int_reducer_proof = None;
-                proof.int_lifts_at_r_star.clear();
+                proof.int_evals_at_r_star.clear();
             },
             |res| {
                 assert!(
@@ -2592,9 +2578,9 @@ mod tests {
         );
     }
 
-    /// Negative test: a proof carrying a lifted set past its last int
-    /// group must be refused. Step 6 absorbs whatever the proof carries,
-    /// so an unopened set would steer every challenge after it.
+    /// Negative test: a group carrying an eval past the last committed
+    /// int column must be refused. Step 4b absorbs whatever the group
+    /// carries, so an unopened eval would steer every challenge after it.
     #[test]
     fn test_e2e_two_groups_extra_lift_rejected() {
         let num_vars = 8;
@@ -2607,16 +2593,13 @@ mod tests {
             ),
             |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
             |proof| {
-                let extra = proof.lookup_int_lifted[0].clone();
-                proof.lookup_int_lifted.push(extra);
+                let evals = &mut proof.lookup_proof.groups[0].int_evals_at_r_inner;
+                evals.push(evals[0].clone());
             },
             |res| {
                 assert!(
-                    matches!(
-                        res,
-                        Err(ProtocolError::Lookup(LookupError::GroupCountMismatch { .. }))
-                    ),
-                    "an unopened lifted set must not verify, got {res:?}"
+                    matches!(res, Err(ProtocolError::Lookup(_))),
+                    "an unopened eval must not verify, got {res:?}"
                 );
             },
         );
@@ -2826,7 +2809,7 @@ mod tests {
 
     /// Negative test: a proof that widens the declared table must fail.
     /// The meta is what the verifier builds its subtable from, so a
-    /// `Word{16}` declaration proved as `Word{32}` would admit exactly
+    /// `Word{16}` declaration proved as `Word{20}` would admit exactly
     /// the cells the AIR forbids.
     #[test]
     fn test_e2e_int_word_lookup_widened_table_rejected() {
@@ -2841,7 +2824,7 @@ mod tests {
             |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
             |proof| {
                 proof.lookup_proof.group_meta[0].table_type =
-                    LookupTableType::Word { width: 32, chunk_width: Some(8) };
+                    LookupTableType::Word { width: 20, chunk_width: None };
             },
             |res| {
                 assert!(
@@ -2856,7 +2839,7 @@ mod tests {
     }
 
     /// Negative test: an honest proof of the UAIR that declares
-    /// `Word{32}` must not verify against the one that declares
+    /// `Word{20}` must not verify against the one that declares
     /// `Word{16}`. This is the weakening a tampered meta cannot reach --
     /// every shape in the proof agrees with the wider table -- and the
     /// verifier read that width off the proof, so before the groups were
@@ -2873,7 +2856,7 @@ mod tests {
                 make_iprs(num_vars),
             ),
         );
-        type Wide = IntWordLookupUair<ZtInt, 32>;
+        type Wide = IntWordLookupUair<ZtInt, 20>;
         type Declared = IntWordLookupUair<ZtInt>;
         type Piop<U> = ZincPlusPiop<TestZincTypesIprs, U, F, DEGREE_PLUS_ONE>;
 
