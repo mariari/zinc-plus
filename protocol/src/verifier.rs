@@ -12,7 +12,10 @@ use zinc_piop::{
     },
     sumcheck::multi_degree::MultiDegreeSumcheck,
 };
-use zinc_poly::univariate::dynamic::{DynamicPolynomialConfig, HasDynamicPolynomialConfig};
+use zinc_poly::{
+    Polynomial,
+    univariate::dynamic::{DynamicPolynomialConfig, HasDynamicPolynomialConfig},
+};
 use zinc_transcript::{
     Blake3Transcript,
     traits::{ConstTranscribable, Transcript},
@@ -594,6 +597,27 @@ where
                     expected: sub!(n_families, 1),
                 });
             }
+        }
+        // The PCS opening only binds this many coefficients of a lift; reject longer ones.
+        // Binary columns are committed folded, and the folded opening binds all D.
+        let wit_cols = self.base.uair_signature.witness_cols();
+        let (num_wit_bin, num_wit_arb) =
+            (wit_cols.num_binary_poly_cols(), wit_cols.num_arbitrary_poly_cols());
+        let lane_len = |column: usize| match column {
+            c if c < num_wit_bin => D,
+            c if c < add!(num_wit_bin, num_wit_arb) => {
+                add!(<Zt::ArbitraryZt as ZipTypes>::Comb::DEGREE_BOUND, 1)
+            }
+            _ => add!(<Zt::IntZt as ZipTypes>::Comb::DEGREE_BOUND, 1),
+        };
+        if let Some(column) = self
+            .proof_witness_lifted_evals
+            .iter()
+            .chain(&self.proof_witness_lifted_evals_pp)
+            .flat_map(|lifts| lifts.iter().enumerate())
+            .find_map(|(c, bar_u)| (bar_u.coeffs.len() > lane_len(c)).then_some(c))
+        {
+            return Err(ProtocolError::LiftedEvalDegree { column });
         }
         let proof_witness_lifted_evals = self
             .proof_witness_lifted_evals

@@ -1850,6 +1850,26 @@ mod tests {
     }
 
     #[test]
+    fn test_big_linear_tamper_int_lift_degree() {
+        let num_vars = 8;
+        do_test::<TestZincTypesIprs, BigLinearUair<ZtInt, ZtFmod>>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+            default_project_ideal!(),
+            default_project_fq_ideal!(),
+            |proof| {
+                let lift = proof.witness_lifted_evals[0].last_mut().unwrap();
+                lift.coeffs.push(ZtFmod::default());
+            },
+            |res| assert!(matches!(res, Err(ProtocolError::LiftedEvalDegree { .. }))),
+        );
+    }
+
+    #[test]
     fn test_big_linear_tamper_up_evals() {
         let num_vars = 8;
         do_test::<TestZincTypesIprs, BigLinearUairWithPublicInput<ZtInt, ZtFmod>>(
