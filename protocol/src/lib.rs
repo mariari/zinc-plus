@@ -599,6 +599,12 @@ pub enum ProtocolError<F: SetElement> {
     LiftedEvalProjection(PolyEvaluationError),
     #[error("lifted eval at column {column} has more coefficients than its lane commits")]
     LiftedEvalDegree { column: usize },
+    #[error("commitment {lane} batches {got} polynomials, the signature has {expected}")]
+    CommitmentBatchSize {
+        lane: usize,
+        expected: usize,
+        got: usize,
+    },
     #[error("lookup argument failed: {0}")]
     Lookup(#[from] LookupError),
     #[error("booleanity argument failed: {0}")]
