@@ -683,6 +683,12 @@ pub enum ProtocolError<F: PrimeField, I: Ideal> {
     Pcs(#[from] ZipError),
     #[error("PCS verification failed at column {0}: {1}")]
     PcsVerification(usize, ZipError),
+    #[error("commitment {lane} batches {got} polynomials, the signature has {expected}")]
+    CommitmentBatchSize {
+        lane: usize,
+        expected: usize,
+        got: usize,
+    },
 }
 
 //
