@@ -29,7 +29,7 @@ use zinc_piop::{
     sumcheck::multi_degree::MultiDegreeSumcheck,
 };
 use zinc_poly::{
-    EvaluatablePolynomial, mle::MultilinearExtensionWithConfig,
+    EvaluatablePolynomial, Polynomial, mle::MultilinearExtensionWithConfig,
     univariate::dynamic::over_field::DynamicPolynomialF,
 };
 use zinc_transcript::{
@@ -348,6 +348,25 @@ where
             vp_arb,
             vp_int,
         };
+
+        // Step 7 skips a lane with an empty batch, so batch sizes must match the signature.
+        let witness = base.uair_signature.witness_cols();
+        for (lane, (comm, expected)) in [
+            (&proof.commitments.0, witness.num_binary_poly_cols()),
+            (&proof.commitments.1, witness.num_arbitrary_poly_cols()),
+            (&proof.commitments.2, witness.num_int_cols()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if comm.batch_size != expected {
+                return Err(ProtocolError::CommitmentBatchSize {
+                    lane,
+                    expected,
+                    got: comm.batch_size,
+                });
+            }
+        }
 
         for comm in [
             &proof.commitments.0,
@@ -1222,6 +1241,21 @@ where
         };
 
         let witness_lifted_evals = &self.proof_witness_lifted_evals;
+        // The PCS opening only binds DEGREE_BOUND + 1 coefficients of a lift; reject longer ones.
+        let degree_bound = |column: usize| match column {
+            c if c < num_wit_bin => <Zt::BinaryZt as ZipTypes>::Comb::DEGREE_BOUND,
+            c if c < add!(num_wit_bin, num_wit_arb) => {
+                <Zt::ArbitraryZt as ZipTypes>::Comb::DEGREE_BOUND
+            }
+            _ => <Zt::IntZt as ZipTypes>::Comb::DEGREE_BOUND,
+        };
+        if let Some(column) = witness_lifted_evals
+            .iter()
+            .enumerate()
+            .position(|(c, bar_u)| bar_u.coeffs.len() > add!(degree_bound(c), 1))
+        {
+            return Err(ProtocolError::LiftedEvalDegree { column });
+        }
 
         let all_lifted_evals: Vec<_> = public_lifted[..num_pub_bin]
             .iter()
