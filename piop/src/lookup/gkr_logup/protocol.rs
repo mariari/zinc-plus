@@ -1050,8 +1050,8 @@ where
         if lifts.len() != num_chunks {
             return Err(GkrLogupError::GkrLeafMismatch);
         }
-        // The protocol binds only the first coefficient of an int lift; reject longer ones.
-        if meta.table_type.reads_int_columns() && lifts.iter().any(|lift| lift.coeffs.len() > 1) {
+        // A lift holds chunk_width coefficients (one for an int column); ψ_a must see no more.
+        if lifts.iter().any(|lift| lift.coeffs.len() > chunk_width) {
             return Err(GkrLogupError::GkrLeafMismatch);
         }
         let mut psi_combined = zero.clone();
