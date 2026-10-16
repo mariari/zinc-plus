@@ -517,8 +517,7 @@ where
     }
 }
 
-/// Step 2 skips zero ideals, so an all-zero-ideal UAIR's claims must vanish at the projecting
-/// element. A UAIR with other ideals is skipped: honest SHA-ECDSA residues do not vanish there.
+/// Step 2 skips zero ideals, so each assert_zero claim must vanish at the projecting element.
 fn check_assert_zero_claims<U, F, IdealOverF>(
     values: &[DynamicPolynomialF<F>],
     projecting_element_f: &F,
@@ -529,10 +528,10 @@ where
     IdealOverF: Ideal,
 {
     let ideals = collect_ideals::<U>(count_constraints::<U>()).ideals;
-    if ideals.iter().any(|i| !i.is_zero_ideal()) {
-        return Ok(());
-    }
-    for (i, value) in values.iter().enumerate() {
+    for (i, (ideal, value)) in ideals.iter().zip(values).enumerate() {
+        if !ideal.is_zero_ideal() {
+            continue;
+        }
         let at_psi = value
             .evaluate_at_point(projecting_element_f)
             .map_err(ProtocolError::LiftedEvalProjection)?;

@@ -426,7 +426,7 @@ where
         let ideal_collector = collect_ideals::<U>(num_constraints);
 
         // Only check non-trivial ideals. An assert_zero value is its constraint's residue, which
-        // the verifier checks at the projecting element only for an all-zero-ideal UAIR.
+        // the verifier checks at the projecting element.
         let (non_trivial_ideals, non_trivial_values): (Vec<_>, Vec<_>) = ideal_collector
             .ideals
             .iter()

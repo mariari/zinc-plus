@@ -3176,6 +3176,41 @@ mod tests {
         assert!(matches!(res, Err(ProtocolError::AssertZero(_))));
     }
 
+    #[test]
+    fn test_e2e_sha_ecdsa_false_witness() {
+        type Zt = TestShaEcdsaZincTypes;
+        type U = ShaEcdsaUair<ShaEcdsaInt>;
+        let pp = setup_pp::<Zt>(
+            SHA_ECDSA_NUM_VARS,
+            (
+                make_iprs(SHA_ECDSA_NUM_VARS),
+                make_iprs(SHA_ECDSA_NUM_VARS),
+                make_iprs(SHA_ECDSA_NUM_VARS),
+            ),
+        );
+        let mut trace = U::generate_random_trace(SHA_ECDSA_NUM_VARS, &mut rng());
+        trace.int.to_mut()[zinc_test_uair::sha_ecdsa::cols::ECDSA_W_Z_PA].evaluations[5] +=
+            ShaEcdsaInt::from(1);
+        let public_trace = trace.public(&U::signature());
+
+        let proof = ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::prove::<false, CHECKED>(
+            &pp,
+            &trace,
+            SHA_ECDSA_NUM_VARS,
+            project_scalar_fn,
+        )
+        .expect("Prover failed");
+        let res = ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
+            &pp,
+            proof,
+            &public_trace,
+            SHA_ECDSA_NUM_VARS,
+            project_scalar_fn,
+            sha256_test_project_ideal,
+        );
+        assert!(matches!(res, Err(ProtocolError::AssertZero(_))));
+    }
+
     /// End-to-end test: TestUairMixedDegrees.
     ///
     /// Two non-zero-ideal `assert_in_ideal` constraints — one linear
